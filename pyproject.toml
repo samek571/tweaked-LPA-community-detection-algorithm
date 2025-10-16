@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lpkit"
+version = "0.1.0"
+description = "Waaay too big Graph & not enough RAM => near linear time complexity solution"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "Samuel Vasko" }]
+dependencies = []
+
+#TODO
+[project.urls]
+Homepage = "https://TODO.com"
