@@ -6,6 +6,9 @@ from .stream import (
     open_labels_memmap,
     sweep_labels_inplace,
     scan_edgelist,
+    build_block_index,
+    sweep_labels_inplace_blocked,
+    stream_multi_sweep,
 )
 
 __all__ = [
@@ -17,4 +20,7 @@ __all__ = [
     "open_labels_memmap",
     "sweep_labels_inplace",
     "scan_edgelist",
+    "build_block_index",
+    "sweep_labels_inplace_blocked",
+    "stream_multi_sweep",
 ]

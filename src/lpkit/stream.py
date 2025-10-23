@@ -176,3 +176,164 @@ def sweep_labels_inplace(
                     updated += 1
 
     return {"updated": updated, "blocks": int(num_blocks)}
+
+#______________________ improvement for hdd fast seek
+
+#one streaming pass, offset = file byte pos
+#we create array64 with lenght = numblocks+1 where
+#[b*block_size, (b+1)*block_size) lie within [offsets[b], offsets[b+1]).
+def build_block_index(
+        sorted_path: str,
+        *,
+        n: int,
+        block_size: int,
+        index_path: str,
+    ) -> None:
+
+    num_blocks = (n + block_size - 1) // block_size
+    offsets = np.zeros(num_blocks + 1, dtype=np.uint64)
+
+    with open(sorted_path, "rb") as f:
+        offsets[0] = f.tell() #start of block 0
+        last_pos = offsets[0]
+        current_block = 0
+
+        while True:
+            line_start = last_pos #position at the start of the line
+            line = f.readline()
+            last_pos = f.tell() #position after reading the line
+
+            if not line: break
+
+            tmp = line.split()
+            if not tmp: continue
+
+            u = int(tmp[0])
+            b = u // block_size
+            #entering new block b, its offset is marked as start
+            while b > current_block:
+                current_block += 1
+                if current_block <= num_blocks:
+                    offsets[current_block] = line_start
+
+        #endof file
+        offsets[-1] = last_pos
+
+    np.save(index_path, offsets)
+
+
+#one asynchronous LPA sweep, no per-vertex seek
+def sweep_labels_inplace_blocked(
+        sorted_sym_path: str,
+        block_index_path: str,
+        labels_path: str,
+        *,
+        n: int | None = None,
+        block_size: int | None = None,
+        seed: int = 0,
+        tie_break: str = "random",
+    ) -> Dict[str, int]:
+
+    labels = open_labels_memmap(labels_path)
+    offsets = np.load(block_index_path) #len = num_blocks+1
+    num_blocks = offsets.size - 1
+
+    rng = Random(seed)
+    updated = 0
+    block_order = list(range(num_blocks)) #rng of block processing
+    rng.shuffle(block_order)
+
+    #main sweep
+    with open(sorted_sym_path, "rb") as f:
+        for b in block_order:
+
+            #sanity check of offset consistency
+            if int(offsets[b]) >= int(offsets[b + 1]): continue
+
+            #sequential scan of this blocks edge slice
+            f.seek(int(offsets[b]))
+            per_u_neighbors: Dict[int, list[int]] = {}
+            block_end = int(offsets[b + 1])
+            while f.tell() < block_end:
+                line = f.readline()
+                if not line: break
+
+                sp = line.split()
+                if not sp: continue
+
+                u = int(sp[0]); v = int(sp[1])
+                per_u_neighbors.setdefault(u, []).append(v) #adj list of verts in this block
+
+            #rng vertex ordering within block
+            verts = list(per_u_neighbors.keys())
+            rng.shuffle(verts)
+
+            #async label updates
+            for u in verts:
+                cnts: Dict[int, int] = {}
+                for v in per_u_neighbors[u]:
+                    lv = int(labels[v])
+                    cnts[lv] = cnts.get(lv, 0) + 1
+                if not cnts: continue
+
+                max_cnt = max(cnts.values())
+                cands = [lab for lab, c in cnts.items() if c == max_cnt]
+
+                #deterministic testing or rng for tie break
+                if tie_break == "min": new_lab = min(cands)
+                elif tie_break == "max": new_lab = max(cands)
+                else: new_lab = rng.choice(cands)
+
+                #if changed: update label
+                if int(labels[u]) != new_lab:
+                    labels[u] = new_lab
+                    updated += 1
+
+            #dfree memory used by this block b and move on
+            per_u_neighbors.clear()
+
+    return {"updated": updated, "blocks": int(num_blocks)}
+
+
+#Run multiple blocked sweeps until convergence or max_sweeps
+def stream_multi_sweep(
+        sorted_sym_path: str,
+        block_index_path: str,
+        labels_path: str,
+        *,
+        n: int | None = None,
+        block_size: int | None = None,
+        seed: int = 0,
+        max_sweeps: int = 50,
+        min_sweeps: int = 1,
+        tie_break: str = "random",
+    ) -> Dict[str, int]:
+
+    total_updates = 0
+    done = False
+    for s in range(1, max_sweeps + 1):
+        info = sweep_labels_inplace_blocked(
+            sorted_sym_path,
+            block_index_path,
+            labels_path,
+            n=n,
+            block_size=block_size,
+            seed=seed + s, #diff rng across sweeps
+            tie_break=tie_break,
+        )
+
+        total_updates += info["updated"]
+        if info["updated"] == 0 and s >= min_sweeps:
+            done = True
+            sweeps = s
+            break
+    else:
+        sweeps = max_sweeps
+
+    return {
+        "sweeps": sweeps,
+        "converged": int(done),
+        "total_updates": total_updates,
+        "n": int(n) if n is not None else -1,
+        "block_size": int(block_size) if block_size is not None else -1,
+    }
