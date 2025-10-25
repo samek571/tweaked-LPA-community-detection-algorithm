@@ -11,6 +11,8 @@ from .stream import (
     stream_multi_sweep,
 )
 
+from .generate_graph import generate_large_graph
+
 __all__ = [
     "label_propagation",
     "LPAResult",
@@ -23,4 +25,5 @@ __all__ = [
     "build_block_index",
     "sweep_labels_inplace_blocked",
     "stream_multi_sweep",
+    "generate_large_graph",
 ]
