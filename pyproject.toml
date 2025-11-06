@@ -10,8 +10,14 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 authors = [{ name = "Samuel Vasko" }]
-dependencies = []
+dependencies = ["numpy", "scipy"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
 
 #TODO
 [project.urls]
 Homepage = "https://TODO.com"
+
+[project.scripts]
+lpkit = "lpkit.cli:main"

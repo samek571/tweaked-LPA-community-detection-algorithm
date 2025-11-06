@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from collections import defaultdict
 from random import Random
 from typing import List, Sequence, Dict, Optional, Any, NamedTuple
