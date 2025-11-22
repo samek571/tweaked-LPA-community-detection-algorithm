@@ -9,7 +9,8 @@ from .stream import (
     symmetrize_and_sort,
     build_block_index,
     init_labels_memmap,
-    stream_multi_sweep)
+    split_sorted_sym_to_blocks,
+    stream_multi_sweep_parallel_blocks)
 
 
 def _load_adj_from_edgelist(path: str) -> List[List[int]]:
@@ -87,17 +88,26 @@ def run_stream(args) -> int:
 
     #3) multi-sweep
     t0 = time.time()
-    info = stream_multi_sweep(
+    #split sorted_sym into per block files once
+    blocks_dir = str(base.with_suffix(".blocks"))
+    block_paths = split_sorted_sym_to_blocks(
         sorted_sym,
-        block_index,
-        labels_path,
         n=n,
         block_size=block_size,
+        out_dir=blocks_dir)
+
+    workers = args.workers if getattr(args, "parallel", False) else 1
+    #parallel sweeps over block files, only per-block adjacency stored inside RAM
+    info = stream_multi_sweep_parallel_blocks(
+        block_paths,
+        labels_path,
+        n=meta["n"],
+        block_size=args.block_size,
         seed=args.seed,
         max_sweeps=args.max_sweeps,
         min_sweeps=max(1, min(args.min_sweeps, args.max_sweeps)),
         tie_break=args.tie_break,
-    )
+        workers=workers)
     took = time.time() - t0
 
     #4) summarize
@@ -133,6 +143,8 @@ def main(argv: list[str] | None = None) -> int:
     ps.add_argument("--tie-break", choices=["random", "min", "max"], default="min")
     ps.add_argument("--sorted", default=None, help="(optional) path for .sorted.sym")
     ps.add_argument("--index", default=None, help="(optional) path for .blockidx.npy")
+    ps.add_argument("--parallel", action="store_true", help="Enable parallel block sweeps.")
+    ps.add_argument("--workers", type=int, default=None, help="Number of worker threads.")
     ps.set_defaults(func=run_stream)
 
     args = p.parse_args(argv)

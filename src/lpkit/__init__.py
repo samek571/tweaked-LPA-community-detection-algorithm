@@ -4,11 +4,8 @@ from .stream import (
     init_labels_memmap,
     build_vertex_index,
     open_labels_memmap,
-    sweep_labels_inplace,
     scan_edgelist,
     build_block_index,
-    sweep_labels_inplace_blocked,
-    stream_multi_sweep,
 )
 
 from .generate_graph import generate_large_graph
@@ -20,10 +17,7 @@ __all__ = [
     "init_labels_memmap",
     "build_vertex_index",
     "open_labels_memmap",
-    "sweep_labels_inplace",
     "scan_edgelist",
     "build_block_index",
-    "sweep_labels_inplace_blocked",
-    "stream_multi_sweep",
     "generate_large_graph",
 ]

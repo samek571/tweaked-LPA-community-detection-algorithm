@@ -1,9 +1,12 @@
 import os
 import shutil
 import subprocess
-from typing import Iterator, Optional, Tuple, Dict
 import numpy as np
+import struct
 from random import Random
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from typing import Iterator, Optional, Tuple, Dict, List
 
 
 def _iter_edges(path: str, ignore_line_its_comment: str = "#") -> Iterator[Tuple[int, int]]:
@@ -123,61 +126,6 @@ def init_labels_memmap(path: str, *, n: int, dtype=np.uint64) -> np.memmap:
 def open_labels_memmap(path: str) -> np.memmap:
     return np.lib.format.open_memmap(path, mode="r+")
 
-# async rng sweep
-# for each rng vertex u compute neighbor label histogram using actual labels and update u after
-def sweep_labels_inplace(
-        sorted_sym_path: str,
-        offsets_path: str,
-        degrees_path: str,
-        labels_path: str,
-        *,
-        n: int,
-        block_size: int,
-        seed: Optional[int] = 0,
-    ) -> Dict[str, int]:
-
-    labels = open_labels_memmap(labels_path)
-    offsets = np.lib.format.open_memmap(offsets_path, mode="r")
-    degrees = np.lib.format.open_memmap(degrees_path, mode="r")
-
-    rng, updated = Random(seed), 0
-    num_blocks = (n + block_size - 1) // block_size
-    block_order = list(range(num_blocks))
-    rng.shuffle(block_order)
-    with open(sorted_sym_path, "rb") as f: #lazy loading by os, not everything is in RAM
-        for b in block_order:
-
-            low = b * block_size
-            high = min(n, (b + 1) * block_size)
-            vertices = list(range(low, high))
-            rng.shuffle(vertices)
-
-            #async updates
-            for u in vertices:
-                deg_u = int(degrees[u])
-                if deg_u == 0: continue
-
-                f.seek(int(offsets[u])) #move to that vertex offset
-                #recompute counts from newer labels
-                cnts: Dict[int, int] = {}
-                for _ in range(deg_u):
-                    line = f.readline() #this acrually is in ram
-                    if not line: break
-
-                    lab_v = int(labels[int(line.split()[-1])])
-                    cnts[lab_v] = cnts.get(lab_v, 0) + 1
-
-                if not cnts: continue
-
-                max_cnt = max(cnts.values())
-                new_lab = rng.choice([lab for lab, c in cnts.items() if c == max_cnt])
-                if int(labels[u]) != new_lab:
-                    labels[u] = new_lab
-                    updated += 1
-
-    return {"updated": updated, "blocks": int(num_blocks)}
-
-#______________________ improvement for hdd fast seek
 
 #one streaming pass, offset = file byte pos
 #we create array64 with lenght = numblocks+1 where
@@ -222,108 +170,169 @@ def build_block_index(
     np.save(index_path, offsets)
 
 
-#one asynchronous LPA sweep, no per-vertex seek
-def sweep_labels_inplace_blocked(
+#one pass over sorted symmetric edgelist, gets splitted into per-block binary files, prep for cython/C idk yet
+#returns a list of paths to bin files, little endian unit32 pairs where u in [b*block_size, (b+1)*block_size).
+def split_sorted_sym_to_blocks(
         sorted_sym_path: str,
-        block_index_path: str,
+        *,
+        n: int,
+        block_size: int,
+        out_dir: str | None = None,
+    ) -> list[str]:
+
+    base = Path(sorted_sym_path)
+    if out_dir is None:
+        out_dir = base.with_suffix(".blocks")
+    out_dir_path = Path(out_dir)
+    out_dir_path.mkdir(parents=True, exist_ok=True)
+
+    num_blocks = (n + block_size - 1) // block_size
+    block_paths = [out_dir_path / f"block_{b:05d}.bin" for b in range(num_blocks)]
+
+    current_block = 0
+    fout = open(block_paths[current_block], "wb")
+
+    with open(sorted_sym_path, "r", encoding="utf-8") as fin:
+        for line in fin:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            a, b = line.split()
+            u = int(a)
+            v = int(b)
+            target_block = u // block_size
+
+            #closer to the block where u belongs
+            while target_block > current_block:
+                fout.close()
+                current_block += 1
+                fout = open(block_paths[current_block], "wb")
+
+            #(u,v) as two uint32 little-endian
+            fout.write(struct.pack("<II", u, v))
+
+    fout.close()
+
+    for b in range(current_block + 1, num_blocks):
+        block_paths[b].touch() #in case we never reach them, new gets made
+
+    return [str(p) for p in block_paths]
+
+#in one sweep -
+# - take a snapshot of labels into RAM
+# - process blocks in random order (optionally in parallel)
+# - accumulate updates per block
+# - apply updates back into the memmap
+def stream_multi_sweep_parallel_blocks(
+        block_paths: list[str],
         labels_path: str,
         *,
-        n: int | None = None,
-        block_size: int | None = None,
-        seed: int = 0,
-        tie_break: str = "random",
-    ) -> Dict[str, int]:
-
-    labels = open_labels_memmap(labels_path)
-    offsets = np.load(block_index_path) #len = num_blocks+1
-    num_blocks = offsets.size - 1
-
-    rng = Random(seed)
-    updated = 0
-    block_order = list(range(num_blocks)) #rng of block processing
-    rng.shuffle(block_order)
-
-    #main sweep
-    with open(sorted_sym_path, "rb") as f:
-        for b in block_order:
-
-            #sanity check of offset consistency
-            if int(offsets[b]) >= int(offsets[b + 1]): continue
-
-            #sequential scan of this blocks edge slice
-            f.seek(int(offsets[b]))
-            per_u_neighbors: Dict[int, list[int]] = {}
-            block_end = int(offsets[b + 1])
-            while f.tell() < block_end:
-                line = f.readline()
-                if not line: break
-
-                sp = line.split()
-                if not sp: continue
-
-                u = int(sp[0]); v = int(sp[1])
-                per_u_neighbors.setdefault(u, []).append(v) #adj list of verts in this block
-
-            #rng vertex ordering within block
-            verts = list(per_u_neighbors.keys())
-            rng.shuffle(verts)
-
-            #async label updates
-            for u in verts:
-                cnts: Dict[int, int] = {}
-                for v in per_u_neighbors[u]:
-                    lv = int(labels[v])
-                    cnts[lv] = cnts.get(lv, 0) + 1
-                if not cnts: continue
-
-                max_cnt = max(cnts.values())
-                cands = [lab for lab, c in cnts.items() if c == max_cnt]
-
-                #deterministic testing or rng for tie break
-                if tie_break == "min": new_lab = min(cands)
-                elif tie_break == "max": new_lab = max(cands)
-                else: new_lab = rng.choice(cands)
-
-                #if changed: update label
-                if int(labels[u]) != new_lab:
-                    labels[u] = new_lab
-                    updated += 1
-
-            #dfree memory used by this block b and move on
-            per_u_neighbors.clear()
-
-    return {"updated": updated, "blocks": int(num_blocks)}
-
-
-#Run multiple blocked sweeps until convergence or max_sweeps
-def stream_multi_sweep(
-        sorted_sym_path: str,
-        block_index_path: str,
-        labels_path: str,
-        *,
-        n: int | None = None,
+        n: int,
         block_size: int | None = None,
         seed: int = 0,
         max_sweeps: int = 50,
         min_sweeps: int = 1,
         tie_break: str = "random",
+        workers: int | None = None, #if 1 it is sequential
+        epsilon: float = 1e-4,
     ) -> Dict[str, int]:
 
-    total_updates = 0
-    done = False
-    for s in range(1, max_sweeps + 1):
-        info = sweep_labels_inplace_blocked(
-            sorted_sym_path,
-            block_index_path,
-            labels_path,
-            n=n,
-            block_size=block_size,
-            seed=seed + s, #diff rng across sweeps
-            tie_break=tie_break,
-        )
+    labels = open_labels_memmap(labels_path)
+    num_blocks = len(block_paths)
+    total_updates, done= 0, False
 
-        total_updates += info["updated"]
-        if info["updated"] == 0 and s >= min_sweeps:
+    if workers is None or workers <= 0:
+        workers = os.cpu_count() or 4
+
+    #one binary block file is loeaded and built u neighbor lists, then label is computed all u in block using snapshot
+    def process_block(block_idx: int, sweep_seed: int) -> Dict[int, int]:
+        """
+        Load one binary block file, build per-u neighbor lists,
+        and compute label updates for all u in this block using snapshot.
+        """
+        path = block_paths[block_idx]
+        #loading as memmap of uint32
+        data = np.memmap(path, mode="r", dtype=np.uint32)
+        if data.size == 0:
+            return {}
+
+        edges = np.reshape(data, (-1, 2))
+        per_u_neighbors: Dict[int, List[int]] = {}
+
+        #adjacency for this block
+        for (u, v) in edges:
+            u_int = int(u)
+            v_int = int(v)
+            per_u_neighbors.setdefault(u_int, []).append(v_int)
+
+        loc_rng = Random(sweep_seed + block_idx)
+        verts = list(per_u_neighbors.keys())
+        loc_rng.shuffle(verts)
+
+        updates: Dict[int, int] = {}
+        for u in verts:
+            cnts: Dict[int, int] = {}
+            for v in per_u_neighbors[u]:
+                lv = int(snapshot[v])
+                cnts[lv] = cnts.get(lv, 0) + 1
+            if not cnts:
+                continue
+
+            max_cnt = max(cnts.values())
+            cands = [lab for lab, c in cnts.items() if c == max_cnt]
+
+            if tie_break == "min":
+                new_lab = min(cands)
+            elif tie_break == "max":
+                new_lab = max(cands)
+            else:
+                new_lab = loc_rng.choice(cands)
+
+            if new_lab != int(snapshot[u]):
+                updates[u] = new_lab
+
+        return updates
+
+    for s in range(1, max_sweeps + 1):
+        print(f"\r[sweep {s}/{max_sweeps}] running...", end="", flush=True)
+
+        snapshot = np.asarray(labels, dtype=np.int64)
+        rng = Random(seed + s)
+        block_order = list(range(num_blocks))
+        rng.shuffle(block_order)
+        updated_this = 0
+        if workers == 1: #==sequential
+            for b in block_order:
+                block_updates = process_block(b, seed + s * 1000003)
+                for u, new_lab in block_updates.items():
+                    labels[u] = new_lab
+                    updated_this += 1
+        else:
+            #parallel with threads (I/O + Python overhead still present, but no text parsing, prep for C/Cython
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futures = [
+                    ex.submit(process_block, b, seed + s * 1000003)
+                    for b in block_order
+                ]
+                done_blocks = 0
+                for fut in futures:
+                    block_updates = fut.result()
+                    for u, new_lab in block_updates.items():
+                        labels[u] = new_lab
+                        updated_this += 1
+                    done_blocks += 1
+                    if workers <= 16:
+                        print(
+                            f"\r[sweep {s}/{max_sweeps}] running... block {done_blocks}/{num_blocks}",
+                            end="",
+                            flush=True,
+                        )
+
+        labels.flush()
+        total_updates += updated_this
+        print(f"\r[sweep {s}/{max_sweeps}] updated={updated_this}      ", end="", flush=True)
+
+        if updated_this <= epsilon * n and s >= min_sweeps: #early stop
             done = True
             sweeps = s
             break
@@ -333,7 +342,9 @@ def stream_multi_sweep(
     return {
         "sweeps": sweeps,
         "converged": int(done),
-        "total_updates": total_updates,
-        "n": int(n) if n is not None else -1,
+        "total_updates": int(total_updates),
+        "n": int(n),
         "block_size": int(block_size) if block_size is not None else -1,
+        "parallel": int(workers > 1),
+        "workers": int(workers),
     }
