@@ -1,6 +1,11 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = [
+    "setuptools>=61",
+    "wheel",
+    "Cython",
+    "numpy",
+]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "lpkit"

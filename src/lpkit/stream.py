@@ -8,6 +8,12 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from typing import Iterator, Optional, Tuple, Dict, List
 
+try:
+    from lpkit import _cprop
+    HAS_CPROP = True
+except Exception:
+    HAS_CPROP = False
+
 
 def _iter_edges(path: str, ignore_line_its_comment: str = "#") -> Iterator[Tuple[int, int]]:
     #yields edges (u, v) line by line without prior or posterior knowledge, each line is discrete
@@ -234,8 +240,10 @@ def stream_multi_sweep_parallel_blocks(
         min_sweeps: int = 1,
         tie_break: str = "random",
         workers: int | None = None, #if 1 it is sequential
-        epsilon: float = 1e-4,
     ) -> Dict[str, int]:
+
+    if block_size is None:
+        block_size = 5000
 
     labels = open_labels_memmap(labels_path)
     num_blocks = len(block_paths)
@@ -244,54 +252,63 @@ def stream_multi_sweep_parallel_blocks(
     if workers is None or workers <= 0:
         workers = os.cpu_count() or 4
 
+    #Cython comes in handy
+    def tb_code():
+        if tie_break == "min": return 1
+        if tie_break == "max": return 2
+        return 0
+
+    TB = tb_code()
+
     #one binary block file is loeaded and built u neighbor lists, then label is computed all u in block using snapshot
+    #if Cython kernel (_cprop.lpa_block) is available, we use it for like massive improvements
     def process_block(block_idx: int, sweep_seed: int) -> Dict[int, int]:
-        """
-        Load one binary block file, build per-u neighbor lists,
-        and compute label updates for all u in this block using snapshot.
-        """
         path = block_paths[block_idx]
-        #loading as memmap of uint32
-        data = np.memmap(path, mode="r", dtype=np.uint32)
+        data = np.memmap(path, mode="r+", dtype=np.uint32)
         if data.size == 0:
             return {}
 
-        edges = np.reshape(data, (-1, 2))
+        edges = data.reshape(-1, 2)
+
+        # fast path: Cython kernel, no Python preprocessing
+        if HAS_CPROP:
+            return _cprop.lpa_block(edges, snapshot, TB, sweep_seed + block_idx)
+
+        # python fallback
         per_u_neighbors: Dict[int, List[int]] = {}
-
-        #adjacency for this block
-        for (u, v) in edges:
-            u_int = int(u)
-            v_int = int(v)
-            per_u_neighbors.setdefault(u_int, []).append(v_int)
-
-        loc_rng = Random(sweep_seed + block_idx)
-        verts = list(per_u_neighbors.keys())
-        loc_rng.shuffle(verts)
+        for u, v in edges:
+            per_u_neighbors.setdefault(u, []).append(v)
 
         updates: Dict[int, int] = {}
+        verts = list(per_u_neighbors.keys())
+        rng_loc = Random(sweep_seed + block_idx)
+        rng_loc.shuffle(verts)
+
         for u in verts:
-            cnts: Dict[int, int] = {}
-            for v in per_u_neighbors[u]:
-                lv = int(snapshot[v])
-                cnts[lv] = cnts.get(lv, 0) + 1
-            if not cnts:
+            neighs = per_u_neighbors[u]
+            if not neighs:
                 continue
 
-            max_cnt = max(cnts.values())
-            cands = [lab for lab, c in cnts.items() if c == max_cnt]
+            cnts: Dict[int, int] = {}
+            for v in neighs:
+                lv = int(snapshot[v])
+                cnts[lv] = cnts.get(lv, 0) + 1
 
+            max_cnt = max(cnts.values())
             if tie_break == "min":
-                new_lab = min(cands)
+                new_lab = min([lab for lab, c in cnts.items() if c == max_cnt])
             elif tie_break == "max":
-                new_lab = max(cands)
+                new_lab = max([lab for lab, c in cnts.items() if c == max_cnt])
             else:
-                new_lab = loc_rng.choice(cands)
+                r = Random(sweep_seed + u)
+                cands = [lab for lab, c in cnts.items() if c == max_cnt]
+                new_lab = r.choice(cands)
 
             if new_lab != int(snapshot[u]):
                 updates[u] = new_lab
 
         return updates
+
 
     for s in range(1, max_sweeps + 1):
         print(f"\r[sweep {s}/{max_sweeps}] running...", end="", flush=True)
@@ -301,14 +318,13 @@ def stream_multi_sweep_parallel_blocks(
         block_order = list(range(num_blocks))
         rng.shuffle(block_order)
         updated_this = 0
-        if workers == 1: #==sequential
+        if workers == 1: #sequential
             for b in block_order:
                 block_updates = process_block(b, seed + s * 1000003)
                 for u, new_lab in block_updates.items():
                     labels[u] = new_lab
                     updated_this += 1
-        else:
-            #parallel with threads (I/O + Python overhead still present, but no text parsing, prep for C/Cython
+        else: #parallel
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 futures = [
                     ex.submit(process_block, b, seed + s * 1000003)
@@ -332,7 +348,7 @@ def stream_multi_sweep_parallel_blocks(
         total_updates += updated_this
         print(f"\r[sweep {s}/{max_sweeps}] updated={updated_this}      ", end="", flush=True)
 
-        if updated_this <= epsilon * n and s >= min_sweeps: #early stop
+        if updated_this <= 1e-4*n and s >= min_sweeps:
             done = True
             sweeps = s
             break
@@ -348,3 +364,45 @@ def stream_multi_sweep_parallel_blocks(
         "parallel": int(workers > 1),
         "workers": int(workers),
     }
+
+def is_global_stable(sorted_sym_path, snapshot):
+    with open(sorted_sym_path, "r") as f:
+        last_u = None
+        neighbor_labels = []
+
+        for line in f:
+            u, v = map(int, line.split())
+
+            if last_u is None:
+                last_u = u
+
+            if u != last_u:
+                #evaluate stability for last_u
+                if not is_vertex_stable(last_u, neighbor_labels, snapshot):
+                    return False
+                last_u = u
+                neighbor_labels = []
+
+            neighbor_labels.append(snapshot[v])
+
+        if last_u is not None:
+            if not is_vertex_stable(last_u, neighbor_labels, snapshot):
+                return False
+
+    return True
+
+
+#count frequencies
+def is_vertex_stable(u, neigh_labels, snapshot):
+    #max degr is small == python sufficies
+    cnt = {}
+    for L in neigh_labels:
+        cnt[L] = cnt.get(L, 0) + 1
+
+    if not cnt:
+        return True
+
+    max_count = max(cnt.values())
+    my_label = snapshot[u]
+    my_count = cnt.get(my_label, 0)
+    return my_count >= max_count

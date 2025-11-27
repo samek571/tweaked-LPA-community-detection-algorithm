@@ -110,6 +110,9 @@ def run_stream(args) -> int:
         workers=workers)
     took = time.time() - t0
 
+    if args.block_size is None:
+        args.block_size = 5000
+
     #4) summarize
     mm = np.lib.format.open_memmap(labels_path, mode="r+")
     _summarize(mm, info, took, f"STREAM(bs={block_size})")
