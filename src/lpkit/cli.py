@@ -67,7 +67,13 @@ def run_ram(args) -> int:
 
 
 def run_stream(args) -> int:
-    outp = Path(args.out_path)
+    outp = Path(args.in_path)
+    if not outp.exists():
+        raise FileNotFoundError(
+            f"Input edgelist not found: {outp}\n"
+            f"Working directory: {Path.cwd()}\n"
+            f"Tip: replace the placeholder path with a real file path."
+        )
     base = outp.with_suffix("")
 
     sorted_sym = str(args.sorted if args.sorted else base.with_suffix(".sorted.sym"))

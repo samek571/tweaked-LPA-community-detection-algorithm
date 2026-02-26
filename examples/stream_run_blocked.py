@@ -1,17 +1,18 @@
 from pathlib import Path
 import numpy as np
-from lpkit import (
+
+from lpkit.stream import (
     symmetrize_and_sort,
-    build_block_index,
+    split_sorted_sym_to_blocks,
     init_labels_memmap,
-    sweep_labels_inplace_blocked,
-    stream_multi_sweep)
+    stream_multi_sweep_parallel_blocks,
+)
 
 BASE = Path(__file__).resolve().parent
-RAW      = BASE / "simple.edgelist"        #input edge list
-SORTED   = BASE / "simple.sorted.sym"      #symetric + sorted by source
-BLOCKIDX = BASE / "simple.blockidx.npy"    #idx of blocks
-LABELS   = BASE / "simple.labels.npy"      #labels (memmap file)
+RAW          = BASE / "simple.edgelist"         #input edge list
+SORTED      = BASE / "simple.sorted.sym"        #symetric + sorted by source
+LABELS      = BASE / "simple.labels.npy"        #labels (memmap file)
+BLOCKS_DIR   = BASE / "simple.blockidx"         #idx of blocks
 
 # create tiny input if missing
 BASE.mkdir(parents=True, exist_ok=True)
@@ -26,19 +27,23 @@ meta = symmetrize_and_sort(str(RAW), str(SORTED))
 n = meta["n"]
 print("sym+sort:", meta)   #{'n': 6, 'm': 6} for 2clieuqs
 
-block_size = max(1, n)  #full graph as one block for parity
-build_block_index(str(SORTED), n=n, block_size=block_size, index_path=str(BLOCKIDX))
-
+block_size = max(1, n // 2)
+block_paths = split_sorted_sym_to_blocks(str(SORTED), n=n, block_size=block_size, out_dir=str(BLOCKS_DIR))
 init_labels_memmap(str(LABELS), n=n)
 
-#single blocked sweep
-info = sweep_labels_inplace_blocked(str(SORTED), str(BLOCKIDX), str(LABELS), n=n, block_size=block_size, seed=42, tie_break="min")
-print("one sweep:", info)
-
-#multisweep until convergence (optional)
-fin = stream_multi_sweep(str(SORTED), str(BLOCKIDX), str(LABELS), n=n, block_size=block_size, seed=123, max_sweeps=10, tie_break="min")
-print("multi-sweep:", fin)
+info = stream_multi_sweep_parallel_blocks(
+    block_paths,
+    str(LABELS),
+    n=n,
+    block_size=block_size,
+    seed=123,
+    max_sweeps=100,
+    min_sweeps=1,
+    tie_break="min",
+    workers=1,
+)
+print("stream:", info)
 
 mm = np.lib.format.open_memmap(str(LABELS), mode="r+")
 print("labels:", list(mm))
-print("unique:", len(set(mm)))
+print("unique:", len(set(map(int, mm))))

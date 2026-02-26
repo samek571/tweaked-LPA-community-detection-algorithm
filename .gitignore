@@ -6,3 +6,7 @@ __pycache__/
 *.sym
 *.npy
 *.edgelist
+*.sorted.sym
+*.labels.npy
+*.blockidx.npy
+*.blocks/

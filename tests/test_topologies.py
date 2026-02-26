@@ -2,8 +2,13 @@ import time
 import numpy as np
 from pathlib import Path
 from util_topologies import write_grid_graph, write_clusters_graph
-from lpkit import (label_propagation, symmetrize_and_sort, build_block_index, init_labels_memmap, stream_multi_sweep)
-
+from lpkit.label_propagation import label_propagation
+from lpkit.stream import (
+    symmetrize_and_sort,
+    split_sorted_sym_to_blocks,
+    init_labels_memmap,
+    stream_multi_sweep_parallel_blocks,
+)
 
 def _load_adj_from_edgelist(path: Path):
     with open(path) as f:
@@ -25,23 +30,30 @@ def _run_ram(adj, seed=1337, max_sweeps=200):
 
 def _run_hdd(raw_path: Path, n: int, block_size: int, seed=1337, max_sweeps=200):
     sorted_sym = raw_path.with_suffix(".sorted.sym")
-    idx = raw_path.with_suffix(".blockidx.npy")
     labels = raw_path.with_suffix(".labels.npy")
+    blocks_dir = raw_path.with_suffix(".blocks")
 
     meta = symmetrize_and_sort(str(raw_path), str(sorted_sym))
+    n = meta["n"]
     bs = max(1, min(block_size, n))
-    build_block_index(str(sorted_sym), n=meta["n"], block_size=bs, index_path=str(idx))
-    init_labels_memmap(str(labels), n=meta["n"])
-    t0 = time.time()
-    info = stream_multi_sweep(
+    block_paths = split_sorted_sym_to_blocks(
         str(sorted_sym),
-        str(idx),
+        n=n,
+        block_size=bs,
+        out_dir=str(blocks_dir),
+    )
+    init_labels_memmap(str(labels), n=n)
+    t0 = time.time()
+    info = stream_multi_sweep_parallel_blocks(
+        block_paths,
         str(labels),
-        n=meta["n"],
+        n=n,
         block_size=bs,
         seed=seed,
         max_sweeps=max_sweeps,
+        min_sweeps=1,
         tie_break="min",
+        workers=1,
     )
     dt = time.time() - t0
     mm = np.lib.format.open_memmap(str(labels), mode="r+")
@@ -69,6 +81,9 @@ def test_grid_graph(tmp_path):
         f"\nHDD_n4={hdd_n4['num']} "
         f"\nHDD_1k={hdd_1k['num']}\n")
 
+    assert n > 0
+    assert hdd_n["num"] >= 1
+
 
 def test_clusters_graph(tmp_path):
     raw = tmp_path / "clusters.edgelist"
@@ -91,3 +106,6 @@ def test_clusters_graph(tmp_path):
         f"\nHDD_n4={hdd_n4['num']} "
         f"\nHDD_1k={hdd_1k['num']}"
     )
+
+    assert n == k * size
+    assert hdd_n["num"] >= 1

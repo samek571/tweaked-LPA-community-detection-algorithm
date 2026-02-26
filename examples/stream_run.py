@@ -1,17 +1,17 @@
 from pathlib import Path
 import numpy as np
-from lpkit import (
+from lpkit.stream import (
     symmetrize_and_sort,
-    build_vertex_index,
+    split_sorted_sym_to_blocks,
     init_labels_memmap,
-    sweep_labels_inplace)
+    stream_multi_sweep_parallel_blocks)
+
 
 BASE = Path(__file__).resolve().parent
-RAW      = BASE / "simple.edgelist"        #input edge list
-SORTED   = BASE / "simple.sorted.sym"      #symetric + sorted by source
-OFFSETS  = BASE / "simple.offsets.npy"     #byte offsets per vertex (memmap file)
-DEGREES  = BASE / "simple.degrees.npy"     #degree per vertex (memmap file)
-LABELS   = BASE / "simple.labels.npy"      #labels (memmap file)
+RAW         = BASE / "simple.edgelist"        #input edge list
+SORTED      = BASE / "simple.sorted.sym"      #symetric + sorted by source
+LABELS      = BASE / "simple.labels.npy"      #labels (memmap file)
+BLOCKS_DIR  = BASE / "simple.blocks"          #blocks
 
 BASE.mkdir(parents=True, exist_ok=True)
 if not RAW.exists():
@@ -25,26 +25,22 @@ meta = symmetrize_and_sort(str(RAW), str(SORTED))
 n = meta["n"]
 print("sym+sort:", meta)   #{'n': 6, 'm': 6} for 2clieuqs
 
-#on-disk per-vertex index (offsets + deg)
-build_vertex_index(str(SORTED), n=n,
-                   offsets_path=str(OFFSETS),
-                   degrees_path=str(DEGREES))
-
-#on disk labels[i] = i
+block_paths = split_sorted_sym_to_blocks(str(SORTED), n=n, block_size=n, out_dir=str(BLOCKS_DIR))
 init_labels_memmap(str(LABELS), n=n)
 
-#1 async sweep (rng order of u + updates)
-#if graph is small lets use 1block, otherwise chunk
-info = sweep_labels_inplace(str(SORTED),
-                            str(OFFSETS),
-                            str(DEGREES),
-                            str(LABELS),
-                            n=n,
-                            block_size=n,   # one big block
-                            seed=42)
-print("sweep:", info)
+info = stream_multi_sweep_parallel_blocks(
+    block_paths,
+    str(LABELS),
+    n=n,
+    block_size=n,
+    seed=42,
+    max_sweeps=100,
+    min_sweeps=1,
+    tie_break="min",
+    workers=1,
+)
+print("stream:", info)
 
-#final labels and community cnt
 mm = np.lib.format.open_memmap(str(LABELS), mode="r+")
 print("labels:", list(mm))
-print("unique labels:", len(set(mm)))
+print("unique labels:", len(set(map(int, mm))))

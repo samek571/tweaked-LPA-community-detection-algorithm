@@ -2,21 +2,14 @@ import time
 import numpy as np
 import pytest
 from collections import Counter
-from lpkit import (
-    generate_large_graph,
-    label_propagation,
-    symmetrize_and_sort,
-    build_block_index,
-    init_labels_memmap,
-    stream_multi_sweep,
-)
+from lpkit import generate_large_graph, label_propagation
+from lpkit.stream import symmetrize_and_sort, split_sorted_sym_to_blocks, init_labels_memmap, stream_multi_sweep_parallel_blocks
 
 @pytest.mark.parametrize("scale", [1, 10, 100])
 def test_hdd_matches_ram(tmp_path, scale):
     n, m = 1000 * scale, 3000 * scale
 
     raw         = tmp_path / f"g_{scale}.edgelist"
-    idx         = tmp_path / f"g_{scale}.blockidx.npy"
     labels      = tmp_path / f"g_{scale}.labels.npy"
     sorted_sym  = tmp_path / f"g_{scale}.sorted.sym"
 
@@ -42,19 +35,25 @@ def test_hdd_matches_ram(tmp_path, scale):
     #i googled and this should estimate realistic HDD chunking, i am not expert in that expertise so dont take my word for it
     block_size = max(500, n // 20)
 
-    build_block_index(str(sorted_sym), n=meta["n"], block_size=block_size, index_path=str(idx))
+    block_paths = split_sorted_sym_to_blocks(
+        str(sorted_sym),
+        n=meta["n"],
+        block_size=block_size,
+        out_dir=str(tmp_path / f"blocks_{scale}"),
+    )
     init_labels_memmap(str(labels), n=meta["n"])
 
     t0 = time.time()
-    info_stream = stream_multi_sweep(
-        str(sorted_sym),
-        str(idx),
+    info_stream = stream_multi_sweep_parallel_blocks(
+        block_paths,
         str(labels),
         n=meta["n"],
         block_size=block_size,
         seed=1337,
         max_sweeps=500,
-        tie_break="min"
+        min_sweeps=1,
+        tie_break="min",
+        workers=1,
     )
     t_stream = time.time() -t0
     mm = np.lib.format.open_memmap(str(labels), mode="r+")
@@ -69,7 +68,14 @@ def test_hdd_matches_ram(tmp_path, scale):
     assert sum(sizes_ram) == sum(sizes_stream) == n #all vertices
     assert n_stream >= 2, "streaming converged onto a single label, which is fucking weird"
 
-    if n <= 20_000:
+    if n <= 2_000:
+        #smaller graphs are noisy- 3 vs 4 already gives 0.25
+        diff = abs(n_ram - n_stream)
+        ratio = diff / max(n_ram, n_stream)
+        print(f"scale={scale}: RAM={n_ram}, HDD={n_stream}, diff={diff}, ratio={ratio:.3f}")
+        assert ratio <= 0.35, f"Community ratio difference too large at n={n}: {ratio:.3f}"
+
+    elif n <= 20_000:
         #small/medium graphs have similar results
         diff = abs(n_ram - n_stream)
         ratio = diff / max(n_ram, n_stream)
