@@ -1,3 +1,22 @@
+"""Disk-backed / streaming pipeline for Label Propagation.
+
+This module contains the core building blocks used by both the CLI and the
+high-level `stream_lpa(...)` API:
+
+1. scan + symmetrize + external sort of edgelist
+2. optional index construction for byte-seeking (legacy path / tooling)
+3. splitting a sorted symmetric edgelist into binary per-block files
+4. multi-sweep streaming label propagation over those blocks
+
+Important invariants
+--------------------
+- Streaming mode never loads the full adjacency into RAM.
+- Labels are stored in a NumPy `.npy` memmap and mutated in place.
+- Block size is the main throughput vs. RAM tradeoff knob.
+- Determinism requires fixed seed, fixed block size, `tie_break='min'` (or `max`),
+  and `workers=1`.
+"""
+
 import os
 import shutil
 import subprocess
@@ -11,12 +30,20 @@ from typing import Iterator, Optional, Tuple, Dict, List
 try:
     from lpkit import _cprop
     HAS_CPROP = True
-except Exception:
+except Exception: #cytho acceleration is optional
     HAS_CPROP = False
 
 
 def _iter_edges(path: str, ignore_line_its_comment: str = "#") -> Iterator[Tuple[int, int]]:
-    #yields edges (u, v) line by line without prior or posterior knowledge, each line is discrete
+    """Yield `(u, v)` edges from a text edgelist.
+
+    Parameters
+    ----------
+    path:
+        Edgelist file (`u v` per line).
+    ignore_line_its_comment:
+        Prefix used to skip comment lines.
+    """
     with open(path, "r") as f:
         for discrete_line in f:
             discrete_line = discrete_line.strip()
@@ -27,8 +54,18 @@ def _iter_edges(path: str, ignore_line_its_comment: str = "#") -> Iterator[Tuple
 
 
 def scan_edgelist(path: str, ignore_line_its_comment: str = "#") -> Tuple[int, int]:
-    #one streaming pass, O(1) RAM as we keep only nm
-    #(and O(E) time)
+    """Single-pass scan returning `(n, m)` for a text edgelist.
+
+    Returns
+    -------
+    (n, m)
+        `n` is inferred as `max_vertex_id + 1`, `m` is the number of parsed input
+        lines (i.e. edges before symmetrization).
+
+    Notes
+    -----
+    This uses O(1) extra RAM (besides parsing buffers) and O(m) time.
+    """
     n, m = 0, 0 #label arr len, m: num of lines aka undir edges in file
     for u, v in _iter_edges(path, ignore_line_its_comment):
         if u < 0 or v < 0:
@@ -38,9 +75,6 @@ def scan_edgelist(path: str, ignore_line_its_comment: str = "#") -> Tuple[int, i
     return n, m
 
 
-#makes uv and vu + sort by u then by v (makes O(1) seeking to u without the need of adj list in RAM)
-#guarantees consequitveness
-#no deduplication (we are dealing with hypergraphs)
 def symmetrize_and_sort(
         in_path: str,
         out_path: str,
@@ -48,7 +82,19 @@ def symmetrize_and_sort(
         ignore_line_its_comment: str = "#",
         tmp_dir: Optional[str] = None,
     ) -> Dict[str, int]:
-    
+    """Create a sorted symmetric edgelist using external `sort`.
+
+    The output contains both `(u, v)` and `(v, u)` for every input edge. The file
+    is sorted by source vertex `u` (and then by `v`) so later stages can stream by
+    source-vertex blocks.
+
+    Notes
+    -----
+    - No deduplication is performed.
+    - Self loops are preserved.
+    - This is usually the dominant preprocessing stage for large graphs.
+    """
+
     #external sort which doesnt work on ram like mergesort or others
     if shutil.which("sort") is None:
         raise RuntimeError("External 'sort' not found. Fix by installing core-utils or presort file manually (ha ha)")
@@ -68,6 +114,7 @@ def symmetrize_and_sort(
             w.write(f"{v} {u}\n")
 
     #console external optimized sort, -numeric, primary (u) secondary (v), inputfile, outpath
+    # `LC_ALL=C` makes the external sort deterministic bytewise on the same input.
     cmd = ["sort", "-n", "-k1,1", "-k2,2", tmp_unsym, "-o", out_path]
     env = os.environ.copy()
     env["LC_ALL"] = "C" #bytewise deterministic sorting ()
@@ -85,9 +132,16 @@ def build_vertex_index(
         offsets_path: str, #indexed gives start of u
         degrees_path: str, #number of lines for u == out deg in graph
     ) -> None:
+    """Build vertex-level byte-offset and degree memmaps for a sorted edgelist.
 
-    #single pass over sorted n symmetric file
-    #there is no O(n) RAM arrays we write directly to memmaps
+    This is a legacy helper path used by older experiments. The newer streaming path
+    primarily uses `split_sorted_sym_to_blocks(...)`, but the index is still useful
+    for debugging and auxiliary scripts.
+
+    `offsets[u]` points to the first byte position where source vertex `u` appears in
+    the sorted symmetric text file. `degrees[u]` stores the number of outgoing lines
+    for `u` in that file.
+    """
     offsets = np.lib.format.open_memmap(offsets_path, mode="w+", dtype=np.uint64, shape=(n,))
     degrees = np.lib.format.open_memmap(degrees_path, mode="w+", dtype=np.uint64, shape=(n,))
     offsets[:] = 0
@@ -125,17 +179,16 @@ def build_vertex_index(
 
 
 def init_labels_memmap(path: str, *, n: int, dtype=np.uint64) -> np.memmap:
+    """Create label storage as a `.npy` memmap initialized to identity labels."""
     mm = np.lib.format.open_memmap(path, mode="w+", dtype=dtype, shape=(n,))
     mm[:] = np.arange(n, dtype=dtype)
     return mm
 
 def open_labels_memmap(path: str) -> np.memmap:
+    """Open an existing labels memmap for read/write updates."""
     return np.lib.format.open_memmap(path, mode="r+")
 
 
-#one streaming pass, offset = file byte pos
-#we create array64 with lenght = numblocks+1 where
-#[b*block_size, (b+1)*block_size) lie within [offsets[b], offsets[b+1]).
 def build_block_index(
         sorted_path: str,
         *,
@@ -143,7 +196,15 @@ def build_block_index(
         block_size: int,
         index_path: str,
     ) -> None:
+    """Build a byte-offset index for source-vertex blocks in a sorted edgelist.
 
+    The saved array has length `num_blocks + 1`, where each entry marks the byte
+    offset where a new source-vertex block starts in the text file. This is a legacy
+    helper retained for compatibility; the current fast path uses binary split block
+    files generated by `split_sorted_sym_to_blocks(...)`.
+
+    [b*block_size, (b+1)*block_size) lie within [offsets[b], offsets[b+1]).
+    """
     num_blocks = (n + block_size - 1) // block_size
     offsets = np.zeros(num_blocks + 1, dtype=np.uint64)
 
@@ -176,8 +237,6 @@ def build_block_index(
     np.save(index_path, offsets)
 
 
-#one pass over sorted symmetric edgelist, gets splitted into per-block binary files, prep for cython/C idk yet
-#returns a list of paths to bin files, little endian unit32 pairs where u in [b*block_size, (b+1)*block_size).
 def split_sorted_sym_to_blocks(
         sorted_sym_path: str,
         *,
@@ -185,7 +244,17 @@ def split_sorted_sym_to_blocks(
         block_size: int,
         out_dir: str | None = None,
     ) -> list[str]:
+    """Split a sorted symmetric text edgelist into binary per-block files.
 
+    Output block `b` contains little-endian `uint32` pairs `(u, v)` where
+    `u // block_size == b`. Empty trailing blocks are created as empty files so the
+    returned block list always has a stable length (`ceil(n / block_size)`).
+
+    Returns
+    -------
+    list[str]
+        Paths to block files in block index order.
+    """
     base = Path(sorted_sym_path)
     if out_dir is None:
         out_dir = base.with_suffix(".blocks")
@@ -224,11 +293,7 @@ def split_sorted_sym_to_blocks(
 
     return [str(p) for p in block_paths]
 
-#in one sweep -
-# - take a snapshot of labels into RAM
-# - process blocks in random order (optionally in parallel)
-# - accumulate updates per block
-# - apply updates back into the memmap
+
 def stream_multi_sweep_parallel_blocks(
         block_paths: list[str],
         labels_path: str,
@@ -241,7 +306,29 @@ def stream_multi_sweep_parallel_blocks(
         tie_break: str = "random",
         workers: int | None = None, #if 1 it is sequential
     ) -> Dict[str, int]:
+    """Run streaming LPA sweeps over pre-split block files.
 
+    Execution model (per sweep)
+    ---------------------------
+    1. Snapshot current labels into RAM (`snapshot`).
+    2. Process blocks in a shuffled order (sequentially or with threads).
+    3. For each block, compute label updates using the snapshot.
+    4. Apply updates to the labels memmap and flush.
+
+    Convergence
+    -----------
+    The current heuristic marks convergence when:
+
+        updated_this_sweep <= 1e-4 * n
+
+    and `s >= min_sweeps`.
+
+    Notes
+    -----
+    - Different `block_size`, `workers`, and tie-breaking can change update order and
+      lead to different local optima (valid but not identical partitions).
+    - `workers=1` is the reproducible default.
+    """
     if block_size is None:
         block_size = 5000
 
@@ -252,17 +339,21 @@ def stream_multi_sweep_parallel_blocks(
     if workers is None or workers <= 0:
         workers = os.cpu_count() or 4
 
-    #Cython comes in handy
     def tb_code():
+        """Map tie-break mode to the integer codes expected by the Cython kernel."""
         if tie_break == "min": return 1
         if tie_break == "max": return 2
         return 0
-
     TB = tb_code()
 
-    #one binary block file is loeaded and built u neighbor lists, then label is computed all u in block using snapshot
-    #if Cython kernel (_cprop.lpa_block) is available, we use it for like massive improvements
     def process_block(block_idx: int, sweep_seed: int) -> Dict[int, int]:
+        """Compute updates for a single block using the current sweep snapshot.
+
+        This returns a sparse mapping `{vertex: new_label}`. The actual memmap writes
+        are applied by the caller so update accounting stays centralized.
+
+        if Cython kernel (_cprop.lpa_block) is available, we use it for like massive improvements
+        """
         path = block_paths[block_idx]
         data = np.memmap(path, mode="r+", dtype=np.uint32)
         if data.size == 0:
@@ -270,11 +361,11 @@ def stream_multi_sweep_parallel_blocks(
 
         edges = data.reshape(-1, 2)
 
-        # fast path: Cython kernel, no Python preprocessing
+        # fast path: Cython kernel, no Python preprocessing (consumes raw edges + snapshot directly)
         if HAS_CPROP:
             return _cprop.lpa_block(edges, snapshot, TB, sweep_seed + block_idx)
 
-        # python fallback
+        # python fallback groups neighbors by source vertex within the block.
         per_u_neighbors: Dict[int, List[int]] = {}
         for u, v in edges:
             per_u_neighbors.setdefault(u, []).append(v)
@@ -313,7 +404,7 @@ def stream_multi_sweep_parallel_blocks(
     for s in range(1, max_sweeps + 1):
         print(f"\r[sweep {s}/{max_sweeps}] running...", end="", flush=True)
 
-        snapshot = np.asarray(labels, dtype=np.int64)
+        snapshot = np.asarray(labels, dtype=np.int64) # decouples read labels (this sweep) from writes
         rng = Random(seed + s)
         block_order = list(range(num_blocks))
         rng.shuffle(block_order)
@@ -324,7 +415,7 @@ def stream_multi_sweep_parallel_blocks(
                 for u, new_lab in block_updates.items():
                     labels[u] = new_lab
                     updated_this += 1
-        else: #parallel
+        else: #parallel block processing still applies updates centrally after future resolution
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 futures = [
                     ex.submit(process_block, b, seed + s * 1000003)
@@ -366,6 +457,11 @@ def stream_multi_sweep_parallel_blocks(
     }
 
 def is_global_stable(sorted_sym_path, snapshot):
+    """Check global LPA stability by scanning a sorted symmetric edgelist.
+
+    This is an expensive verification helper used for diagnostics / experiments,
+    not in the main fast path.
+    """
     with open(sorted_sym_path, "r") as f:
         last_u = None
         neighbor_labels = []
@@ -392,8 +488,8 @@ def is_global_stable(sorted_sym_path, snapshot):
     return True
 
 
-#count frequencies
 def is_vertex_stable(u, neigh_labels, snapshot):
+    """Return whether vertex `u` already holds a maximal-frequency neighbor label."""
     #max degr is small == python sufficies
     cnt = {}
     for L in neigh_labels:

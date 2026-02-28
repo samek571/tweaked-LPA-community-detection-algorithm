@@ -1,3 +1,16 @@
+"""Command-line interface for LPKit.
+
+Subcommands
+-----------
+ram
+    In-memory baseline LPA (useful for small/medium graphs and correctness checks).
+stream
+    Disk-backed streaming LPA pipeline for larger graphs.
+
+The CLI intentionally mirrors the lower-level API functions, so README examples and
+programmatic usage stay aligned.
+"""
+
 import argparse
 import sys
 import time
@@ -14,6 +27,11 @@ from .stream import (
 
 
 def _load_adj_from_edgelist(path: str) -> List[List[int]]:
+    """Load an undirected adjacency list from a 2-column edge list.
+
+    Comment lines starting with `#` or `%` are ignored. Edges are inserted in both
+    directions because RAM mode expects an undir adj list
+    """
     edges: List[Tuple[int, int]] = []
     n = 0
     with open(path, "r") as f:
@@ -34,6 +52,7 @@ def _load_adj_from_edgelist(path: str) -> List[List[int]]:
 
 
 def _write_labels(labels, out_path: str):
+    """Write labels either as `.npy` or as one label per text line."""
     p = Path(out_path)
     if p.suffix == ".npy":
         np.save(out_path, np.asarray(labels, dtype=np.int64))
@@ -44,12 +63,14 @@ def _write_labels(labels, out_path: str):
 
 
 def _summarize(labels, info: dict, took: float, mode: str):
+    """Print a compact run summary similar to benchmark output."""
     k = len(set(int(x) for x in labels))
     print(f"[{mode}] n={len(labels)}  communities={k}  sweeps={info.get('sweeps','?')}  "
         f"converged={info.get('converged','?')}  time={took:.3f}s")
 
 
 def run_ram(args) -> int:
+    """Execute in-memory LPA from CLI arguments."""
     adj = _load_adj_from_edgelist(args.in_path)
     t0 = time.time()
     labels, info = label_propagation(
@@ -67,6 +88,14 @@ def run_ram(args) -> int:
 
 
 def run_stream(args) -> int:
+    """Execute the full streaming pipeline from CLI arguments.
+
+    Artifacts produced (unless custom paths are supplied):
+    - `<base>.sorted.sym`
+    - `<base>.blockidx.npy` (legacy helper index; not required by the new block split path)
+    - `<base>.blocks/`
+    - labels `.npy`
+    """
     outp = Path(args.in_path)
     if not outp.exists():
         raise FileNotFoundError(
@@ -80,7 +109,7 @@ def run_stream(args) -> int:
     block_index = str(args.index if args.index else base.with_suffix(".blockidx.npy"))
     labels_path = str(outp if outp.suffix == ".npy" else base.with_suffix(".labels.npy"))
 
-    #1) sort + symm
+    #1) externalsort + symm
     meta = symmetrize_and_sort(args.in_path, sorted_sym)  # returns {"n","m"}
     n = int(meta["n"])
 
@@ -88,11 +117,11 @@ def run_stream(args) -> int:
     if block_size is None or block_size <= 0:
         block_size = max(1000, n // 20)
 
-    #2) build block index + init labels
+    #2) build (byte-offset) block index + init labels
     build_block_index(sorted_sym, n=n, block_size=block_size, index_path=block_index)
     init_labels_memmap(labels_path, n=n)
 
-    #3) multi-sweep
+    #3) split into binary block files and run streaming sweaping
     t0 = time.time()
     #split sorted_sym into per block files once
     blocks_dir = str(base.with_suffix(".blocks"))
@@ -129,17 +158,19 @@ def run_stream(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse CLI args and dispatch to a subcommand."""
     p = argparse.ArgumentParser(prog="lpkit", description="Label Propagation (RAM or streaming).")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def add_common(sp):
+        """Attach flags shared by RAM and streaming modes."""
         sp.add_argument("--in", dest="in_path", required=True, help="Input edgelist file (u v per line).")
         sp.add_argument("--out", dest="out_path", required=True, help="Output labels file (.npy recommended).")
         sp.add_argument("--seed", type=int, default=0)
         sp.add_argument("--max-sweeps", type=int, default=100)
         sp.add_argument("--min-sweeps", type=int, default=1)
 
-    #RAM
+    #RAM (essential only for some tests and correctness determination)
     pr = sub.add_parser("ram", help="Run in-RAM LPA (baseline).")
     add_common(pr)
     pr.add_argument("--no-shuffle", action="store_true", help="Disable per-sweep vertex shuffling.")

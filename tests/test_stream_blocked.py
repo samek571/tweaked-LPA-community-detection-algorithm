@@ -1,16 +1,23 @@
+"""Streaming tests exercising a "blocked" configuration (smaller block granularity).
+
+This file overlaps with `test_stream.py`, but keeps an explicit block-oriented
+variant for sanity checks and convergence comparison.
+"""
+
 import numpy as np
 from lpkit.label_propagation import label_propagation
 from lpkit.stream import symmetrize_and_sort, split_sorted_sym_to_blocks, init_labels_memmap, stream_multi_sweep_parallel_blocks
 
 
-#partition into frozenset vertex-ids
 def groups_from_labels(labels):
+    """Return a partition representation independent of concrete label values."""
     buckets = {}
     for i, lab in enumerate(labels):
         buckets.setdefault(int(lab), set()).add(i)
     return {frozenset(s) for s in buckets.values()}
 
 def test_blocked_one_sweep_matches_count(tmp_path):
+    """Blocked one-sweep run should execute and produce a valid labels array + metadata."""
     raw = tmp_path / "g.edgelist"
     raw.write_text("0 1\n1 2\n2 0\n3 4\n4 5\n5 3\n")
     sorted_sym = tmp_path / "g.sorted.sym"
@@ -45,6 +52,7 @@ def test_blocked_one_sweep_matches_count(tmp_path):
 
 
 def test_blocked_converges_like_ram(tmp_path):
+    """Blocked streaming configuration should match RAM baseline partition on the toy graph."""
     raw = tmp_path / "g.edgelist"
     raw.write_text("0 1\n1 2\n2 0\n3 4\n4 5\n5 3\n")
     sorted_sym = tmp_path / "g.sorted.sym"

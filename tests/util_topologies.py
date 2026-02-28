@@ -1,8 +1,18 @@
+"""Helpers for generating small structured graphs used in topology tests."""
+
 import random
 from itertools import product
 
 #deg4 per vertex, grid like graph
 def write_grid_graph(path, side_len: int, seed: int = 0):
+    """Write a bidirectional 2D grid graph edgelist.
+
+    Returns
+    -------
+    tuple[int, int]
+        (number_of_vertices, number_of_undirected_edges)
+    """
+
     random.seed(seed)
     n = side_len **2
     edges = []
@@ -26,9 +36,24 @@ def write_grid_graph(path, side_len: int, seed: int = 0):
     return n, len(edges) #num of undir edges
 
 
-#erdos-renyi graph with k_clusters groups, crosscluster edges appear with p_out
-def write_clusters_graph(path, k_clusters: int, cluster_size: int, p_in: float = 0.8,
-    p_out: float = 0.06, seed: int = 0):
+def write_clusters_graph(
+        path,
+        k_clusters: int,
+        cluster_size: int,
+        p_in: float = 0.8,
+        p_out: float = 0.06,
+        seed: int = 0,
+):
+    """Write a clustered Erdős–Rényi-like graph as a bidirectional edgelist.
+
+    - Intra-cluster edges appear with probability `p_in`.
+    - Inter-cluster edges appear with probability `p_out`.
+
+    Returns
+    -------
+    tuple[int, int]
+        (number_of_vertices, number_of_undirected_edges)
+    """
 
     random.seed(seed)
     n = k_clusters * cluster_size

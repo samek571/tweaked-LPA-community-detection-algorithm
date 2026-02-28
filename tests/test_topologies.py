@@ -1,3 +1,10 @@
+"""Topology-oriented comparison tests and exploratory prints.
+
+These tests generate structured graphs (grid / clustered random graph) and run
+both RAM and streaming LPA variants to compare community counts across block sizes.
+Assertions are intentionally weak; this file is more of a sanity/behavior probe.
+"""
+
 import time
 import numpy as np
 from pathlib import Path
@@ -11,6 +18,7 @@ from lpkit.stream import (
 )
 
 def _load_adj_from_edgelist(path: Path):
+    """Load a (possibly already symmetrized) edgelist into an adjacency-list representation."""
     with open(path) as f:
         edges = [tuple(map(int, ln.split())) for ln in f]
     n = (max(max(u, v) for u, v in edges) + 1) if edges else 0
@@ -21,6 +29,7 @@ def _load_adj_from_edgelist(path: Path):
 
 
 def _run_ram(adj, seed=1337, max_sweeps=200):
+    """Run RAM LPA and return compact stats used in topology comparisons."""
     t0 = time.time()
     labels, info = label_propagation(adj, seed=seed, max_sweeps=max_sweeps)
     dt = time.time() - t0
@@ -29,6 +38,7 @@ def _run_ram(adj, seed=1337, max_sweeps=200):
 
 
 def _run_hdd(raw_path: Path, n: int, block_size: int, seed=1337, max_sweeps=200):
+    """Run streaming LPA on an on-disk graph and return compact stats."""
     sorted_sym = raw_path.with_suffix(".sorted.sym")
     labels = raw_path.with_suffix(".labels.npy")
     blocks_dir = raw_path.with_suffix(".blocks")
@@ -62,6 +72,7 @@ def _run_hdd(raw_path: Path, n: int, block_size: int, seed=1337, max_sweeps=200)
 
 
 def test_grid_graph(tmp_path):
+    """Grid graph should be processable by both RAM and streaming paths across block sizes."""
     raw = tmp_path / "grid.edgelist"
     side = 20
     n, _m = write_grid_graph(raw, side_len=side)
@@ -86,6 +97,7 @@ def test_grid_graph(tmp_path):
 
 
 def test_clusters_graph(tmp_path):
+    """Clustered random graph should be processable by both RAM and streaming paths."""
     raw = tmp_path / "clusters.edgelist"
     k, size = 5, 40
     n = k * size

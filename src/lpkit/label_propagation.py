@@ -1,3 +1,13 @@
+"""In-memory reference Label Propagation Algorithm (LPA).
+
+This implementation is intentionally simple and readable. It serves two roles:
+- a baseline for correctness tests against the streaming implementation
+- a usable RAM-mode algorithm for small/medium graphs
+
+The graph is expected to be represented as an undirected adjacency list
+(`u->v` and `v->u` both present).
+"""
+
 from collections import defaultdict
 from random import Random
 from typing import List, Sequence, Dict, Optional, Any, NamedTuple
@@ -7,14 +17,22 @@ Adjacency_list = Sequence[Sequence[int]]
 
 #just a custom DS
 class LPAResult(NamedTuple):
+    """Return type for in-memory LPA.
+
+    Attributes
+    ----------
+    labels:
+        Final label assignment per vertex index.
+    info:
+        Metadata describing convergence and run parameters.
+    """
     labels: List[int]
     info: Dict[str, Any]
 
-"""
-async label propagation as Raghavan–Albert–Kumara (Phys. Rev. E 76, 036106) suggested (see paper)
-time complexity: O(|E| * number_of_sweeps)
-space complexity: O(|E| + |V|)
-"""
+
+#async label propagation as Raghavan–Albert–Kumara (Phys. Rev. E 76, 036106) suggested (see paper)
+#time complexity: O(|E| * number_of_sweeps)
+#space complexity: O(|E| + |V|)
 def label_propagation(
         neighbors: Adjacency_list, #a->b and b->a should exist
         *,
@@ -24,7 +42,27 @@ def label_propagation(
         verify_each_sweep: bool = True,
         shuffle_each_sweep: bool = True
     ) -> LPAResult:
-    
+    """Run in-memory asynchronous label propagation.
+
+    Parameters
+    ----------
+    neighbors:
+        Adjacency list of an undirected graph.
+    seed:
+        RNG seed controlling vertex-order shuffles and random tie-breaking.
+    max_sweeps / min_sweeps:
+        Hard cap and lower bound on the number of sweeps.
+    verify_each_sweep:
+        If True, performs an explicit stability verification pass after each
+        sweep. This adds work but gives a stricter convergence signal.
+    shuffle_each_sweep:
+        If True, updates vertices in a new random order every sweep.
+
+    Returns
+    -------
+    LPAResult
+        `(labels, info)` where `labels` is a list and `info` is metadata.
+    """
     n = len(neighbors)
     labels = list(range(n))
     rng = Random(seed) #deterministic tie breaking, local rng
@@ -32,6 +70,7 @@ def label_propagation(
 
     '''picking best label for v'''
     def _best_label_helper(v: int) -> Label:
+        """Return the most frequent neighbor label for `v` (randomly breaking ties)."""
         cnts: Dict[Label, int] = defaultdict(int)
 
         for u in neighbors[v]:
@@ -60,6 +99,8 @@ def label_propagation(
 
         #convergence check
         if verify_each_sweep:
+            #extra cvg verif pass. sweep can make no changes and
+            #still not be globally stable under some update orders
             stable = True
             for v in range(n):
                 cnts: Dict[Label, int] = defaultdict(int)

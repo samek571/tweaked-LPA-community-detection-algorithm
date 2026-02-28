@@ -1,3 +1,11 @@
+"""Behavioral comparison of RAM LPA vs streaming (disk-backed) LPA.
+
+This is an acceptance-style test, not an exact equivalence proof:
+LPA is update-order sensitive, so community counts may differ slightly even
+with the same seed. Assertions are intentionally loose on small graphs and
+coarser on larger graphs.
+"""
+
 import time
 import numpy as np
 import pytest
@@ -7,6 +15,7 @@ from lpkit.stream import symmetrize_and_sort, split_sorted_sym_to_blocks, init_l
 
 @pytest.mark.parametrize("scale", [1, 10, 100])
 def test_hdd_matches_ram(tmp_path, scale):
+    """Streaming output should be in the same ballpark as RAM baseline across scales."""
     n, m = 1000 * scale, 3000 * scale
 
     raw         = tmp_path / f"g_{scale}.edgelist"
@@ -15,10 +24,10 @@ def test_hdd_matches_ram(tmp_path, scale):
 
     print(f"\n####### running tests at scale {scale} (n={n}, m={m}) ---")
 
-    #gen g on disk
+    #gen Graph on disk
     generate_large_graph(str(raw), n=n, m=m, topology="random", seed=987654 + scale)
 
-    #ram baseline - full adj list in memory
+    #ram baseline - full adj list in memory build
     adj = [[] for _ in range(n)]
     with open(raw) as f:
         for tmp in f:
@@ -32,7 +41,7 @@ def test_hdd_matches_ram(tmp_path, scale):
 
     #hdd pipeline
     meta = symmetrize_and_sort(str(raw), str(sorted_sym))
-    #i googled and this should estimate realistic HDD chunking, i am not expert in that expertise so dont take my word for it
+    #i googled and this should estimate realistic HDD chunking, i am not expert in this tho...
     block_size = max(500, n // 20)
 
     block_paths = split_sorted_sym_to_blocks(

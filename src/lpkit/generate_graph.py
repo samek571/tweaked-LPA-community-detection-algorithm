@@ -1,3 +1,9 @@
+"""Synthetic graph generators used for tests and quick experiments.
+
+These generators intentionally optimize for convenience and determinism rather
+than realism. The output is a plain text edgelist (`u v` per line).
+"""
+
 import os
 import random
 from typing import Literal
@@ -8,11 +14,28 @@ def generate_large_graph(
         *,
         n: int,
         m: int,
-        # TODO other topos for future work possibly, just so i dont have to refactor
         topology: Literal["random", "grid", "clusters"] = "random",
         seed: int = 0,
         self_loops: bool = False,
     ) -> None:
+    """Generate a synthetic graph and write it as an edgelist.
+
+    Parameters
+    ----------
+    out_path:
+        Destination file path.
+    n:
+        Target number of vertices (vertex ids are in `[0, n)`).
+    m:
+        Target number of emitted edges for `random` topology. Other topologies
+        may emit a different number depending on structure.
+    topology:
+        `random`, `grid`, or `clusters`.
+    seed:
+        Deterministic RNG seed.
+    self_loops:
+        Allow `u == v` for random topology.
+    """
 
     rng = random.Random(seed)
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)

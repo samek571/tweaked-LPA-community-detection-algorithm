@@ -1,3 +1,17 @@
+"""System/performance test for streaming LPA under cgroup memory limits.
+
+This test is intentionally gated (`LPKIT_RUN_PERF=1`) and should not run in the
+default unit-test suite. It launches the CLI under `systemd-run --user --scope`
+with different `MemoryMax` values, then checks:
+
+1) Completed runs reach the same endpoint metadata (same graph/seed/params).
+2) Lower memory budgets do not become materially faster (with slack).
+3) OOM/kill under lower memory is treated as a worse outcome, not a false failure.
+
+The test compares medians across repeated runs and randomizes run order to reduce
+cache and scheduler bias.
+"""
+
 import os
 import random
 import re
@@ -69,6 +83,7 @@ def test_memory_budget_trend(tmp_path: Path) -> None:
     env_pythonpath = ":".join(env_pp)
 
     runs = {cap: [] for cap in mem_caps}
+    #shuffle order to reduce warm-cache or ordering bias across memory caps
     schedule = [(cap, rep) for rep in range(repeats) for cap in mem_caps]
     random.Random(20260226).shuffle(schedule)
 
@@ -147,6 +162,7 @@ def test_memory_budget_trend(tmp_path: Path) -> None:
     if len(ok_caps) < 2:
         pytest.skip(f"Too many caps killed/OOM to compare runtimes: { {cap:[r['rc'] for r in runs[cap]] for cap in mem_caps} }")
 
+    #successful runs should end at the same endpoint metadata for same graph/seed/params
     base = None
     for cap in ok_caps:
         for r in runs[cap]:
@@ -156,6 +172,7 @@ def test_memory_budget_trend(tmp_path: Path) -> None:
             base = sig if base is None else base
             assert sig == base, f"Endpoint changed under {cap}M: {sig} != {base}"
 
+    #median to reduce chache noise or scheduling
     med = {cap: statistics.median([r["t"] for r in runs[cap] if r["ok"]]) for cap in ok_caps}
 
     for hi, lo in zip(mem_caps, mem_caps[1:]):
