@@ -14,7 +14,7 @@ from lpkit.stream import (
     symmetrize_and_sort,
     split_sorted_sym_to_blocks,
     init_labels_memmap,
-    stream_multi_sweep_parallel_blocks,
+    stream_multi_sweep_blocks,
 )
 
 def _load_adj_from_edgelist(path: Path):
@@ -54,7 +54,7 @@ def _run_hdd(raw_path: Path, n: int, block_size: int, seed=1337, max_sweeps=200)
     )
     init_labels_memmap(str(labels), n=n)
     t0 = time.time()
-    info = stream_multi_sweep_parallel_blocks(
+    info = stream_multi_sweep_blocks(
         block_paths,
         str(labels),
         n=n,
@@ -63,7 +63,6 @@ def _run_hdd(raw_path: Path, n: int, block_size: int, seed=1337, max_sweeps=200)
         max_sweeps=max_sweeps,
         min_sweeps=1,
         tie_break="min",
-        workers=1,
     )
     dt = time.time() - t0
     mm = np.lib.format.open_memmap(str(labels), mode="r+")

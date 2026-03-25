@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from collections import Counter
 from lpkit import generate_large_graph, label_propagation
-from lpkit.stream import symmetrize_and_sort, split_sorted_sym_to_blocks, init_labels_memmap, stream_multi_sweep_parallel_blocks
+from lpkit.stream import symmetrize_and_sort, split_sorted_sym_to_blocks, init_labels_memmap, stream_multi_sweep_blocks
 
 @pytest.mark.parametrize("scale", [1, 10, 100])
 def test_hdd_matches_ram(tmp_path, scale):
@@ -53,7 +53,7 @@ def test_hdd_matches_ram(tmp_path, scale):
     init_labels_memmap(str(labels), n=meta["n"])
 
     t0 = time.time()
-    info_stream = stream_multi_sweep_parallel_blocks(
+    info_stream = stream_multi_sweep_blocks(
         block_paths,
         str(labels),
         n=meta["n"],
@@ -62,7 +62,6 @@ def test_hdd_matches_ram(tmp_path, scale):
         max_sweeps=500,
         min_sweeps=1,
         tie_break="min",
-        workers=1,
     )
     t_stream = time.time() -t0
     mm = np.lib.format.open_memmap(str(labels), mode="r+")

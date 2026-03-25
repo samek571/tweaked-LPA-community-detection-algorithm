@@ -122,7 +122,7 @@ Classical concept:
 
 LPKit implementations:
 - `label_propagation(...)` in RAM mode
-- the update kernel inside `stream_multi_sweep_parallel_blocks(...)` in streaming mode
+- the update kernel inside `stream_multi_sweep_blocks(...)` in streaming mode
 
 Responsibility:
 - read the labels of neighboring vertices,
@@ -263,7 +263,7 @@ This stage is the concrete implementation of `L(v) = v`.
 ### 6.5 Multi-sweep propagation
 
 Method:
-- `stream_multi_sweep_parallel_blocks(...)`
+- `stream_multi_sweep_blocks(...)`
 
 Responsibilities:
 - iterate over the block list repeatedly,
@@ -339,7 +339,6 @@ Reproducibility in this project requires:
 
 - fixed `seed`,
 - deterministic tie-breaking, typically `tie_break="min"`,
-- `workers=1`,
 - fixed `block_size`,
 - identical input graph.
 
@@ -358,7 +357,7 @@ stream_lpa(...)
     -> symmetrize_and_sort(...)
     -> split_sorted_sym_to_blocks(...)
     -> init_labels_memmap(...)
-    -> stream_multi_sweep_parallel_blocks(...)
+    -> stream_multi_sweep_blocks(...)
 `
 
 Responsibilities of the wrapper:

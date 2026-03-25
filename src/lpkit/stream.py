@@ -14,7 +14,7 @@ Important invariants
 - Labels are stored in a NumPy `.npy` memmap and mutated in place.
 - Block size is the main throughput vs. RAM tradeoff knob.
 - Determinism requires fixed seed, fixed block size, `tie_break='min'` (or `max`),
-  and `workers=1`.
+- Block processing is intentionally sequential.
 """
 
 import os
@@ -24,8 +24,7 @@ import numpy as np
 import struct
 from random import Random
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
-from typing import Iterator, Optional, Tuple, Dict, List
+from typing import Iterator, Optional, Tuple, Dict
 
 try:
     from lpkit import _cprop
@@ -294,7 +293,7 @@ def split_sorted_sym_to_blocks(
     return [str(p) for p in block_paths]
 
 
-def stream_multi_sweep_parallel_blocks(
+def stream_multi_sweep_blocks(
         block_paths: list[str],
         labels_path: str,
         *,
@@ -304,14 +303,13 @@ def stream_multi_sweep_parallel_blocks(
         max_sweeps: int = 50,
         min_sweeps: int = 1,
         tie_break: str = "random",
-        workers: int | None = None, #if 1 it is sequential
     ) -> Dict[str, int]:
     """Run streaming LPA sweeps over pre-split block files.
 
     Execution model (per sweep)
     ---------------------------
     1. Snapshot current labels into RAM (`snapshot`).
-    2. Process blocks in a shuffled order (sequentially or with threads).
+    2. Process blocks in a shuffled order sequentially
     3. For each block, compute label updates using the snapshot.
     4. Apply updates to the labels memmap and flush.
 
@@ -327,7 +325,7 @@ def stream_multi_sweep_parallel_blocks(
     -----
     - Different `block_size`, `workers`, and tie-breaking can change update order and
       lead to different local optima (valid but not identical partitions).
-    - `workers=1` is the reproducible default.
+    - singlethread sequential block processing to keep the sweep semantics deterministic
     """
     if block_size is None:
         block_size = 5000
@@ -335,9 +333,6 @@ def stream_multi_sweep_parallel_blocks(
     labels = open_labels_memmap(labels_path)
     num_blocks = len(block_paths)
     total_updates, done= 0, False
-
-    if workers is None or workers <= 0:
-        workers = os.cpu_count() or 4
 
     def tb_code():
         """Map tie-break mode to the integer codes expected by the Cython kernel."""
@@ -353,9 +348,12 @@ def stream_multi_sweep_parallel_blocks(
         are applied by the caller so update accounting stays centralized.
 
         if Cython kernel (_cprop.lpa_block) is available, we use it for like massive improvements
+        python fallback: block file is already sorted so we maintain only label frequency map for inspected vertex
+        hence we avoid storing all neighbor vertex ids in ram, only labels will suffice improving memory complexity
+        (time complexity stays the same as we need to check trough all of them)
         """
         path = block_paths[block_idx]
-        data = np.memmap(path, mode="r+", dtype=np.uint32)
+        data = np.memmap(path, mode="r", dtype=np.uint32)
         if data.size == 0:
             return {}
 
@@ -365,25 +363,15 @@ def stream_multi_sweep_parallel_blocks(
         if HAS_CPROP:
             return _cprop.lpa_block(edges, snapshot, TB, sweep_seed + block_idx)
 
-        # python fallback groups neighbors by source vertex within the block.
-        per_u_neighbors: Dict[int, List[int]] = {}
-        for u, v in edges:
-            per_u_neighbors.setdefault(u, []).append(v)
 
         updates: Dict[int, int] = {}
-        verts = list(per_u_neighbors.keys())
-        rng_loc = Random(sweep_seed + block_idx)
-        rng_loc.shuffle(verts)
+        current_u: int | None = None
+        cnts: Dict[int, int] = {}
 
-        for u in verts:
-            neighs = per_u_neighbors[u]
-            if not neighs:
-                continue
-
-            cnts: Dict[int, int] = {}
-            for v in neighs:
-                lv = int(snapshot[v])
-                cnts[lv] = cnts.get(lv, 0) + 1
+        def _finalize_vertex(u: int, counts: Dict[int, int]) -> None:
+            """Choose the plurality label for one vertex and stage an update if needed."""
+            if not counts:
+                return
 
             max_cnt = max(cnts.values())
             if tie_break == "min":
@@ -398,6 +386,25 @@ def stream_multi_sweep_parallel_blocks(
             if new_lab != int(snapshot[u]):
                 updates[u] = new_lab
 
+
+        for u_raw, v_raw in edges:
+            u = int(u_raw)
+            v = int(v_raw)
+
+            if current_u is None:
+                current_u = u
+
+            if u != current_u:
+                _finalize_vertex(current_u, cnts)
+                cnts.clear()
+                current_u = u
+
+            lv = int(snapshot[v])
+            cnts[lv] = cnts.get(lv, 0) + 1
+
+        if current_u is not None:
+            _finalize_vertex(current_u, cnts)
+
         return updates
 
 
@@ -409,31 +416,11 @@ def stream_multi_sweep_parallel_blocks(
         block_order = list(range(num_blocks))
         rng.shuffle(block_order)
         updated_this = 0
-        if workers == 1: #sequential
-            for b in block_order:
-                block_updates = process_block(b, seed + s * 1000003)
-                for u, new_lab in block_updates.items():
-                    labels[u] = new_lab
-                    updated_this += 1
-        else: #parallel block processing still applies updates centrally after future resolution
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                futures = [
-                    ex.submit(process_block, b, seed + s * 1000003)
-                    for b in block_order
-                ]
-                done_blocks = 0
-                for fut in futures:
-                    block_updates = fut.result()
-                    for u, new_lab in block_updates.items():
-                        labels[u] = new_lab
-                        updated_this += 1
-                    done_blocks += 1
-                    if workers <= 16:
-                        print(
-                            f"\r[sweep {s}/{max_sweeps}] running... block {done_blocks}/{num_blocks}",
-                            end="",
-                            flush=True,
-                        )
+        for b in block_order:
+            block_updates = process_block(b, seed + s * 1000003)
+            for u, new_lab in block_updates.items():
+                labels[u] = new_lab
+                updated_this += 1
 
         labels.flush()
         total_updates += updated_this
@@ -452,8 +439,6 @@ def stream_multi_sweep_parallel_blocks(
         "total_updates": int(total_updates),
         "n": int(n),
         "block_size": int(block_size) if block_size is not None else -1,
-        "parallel": int(workers > 1),
-        "workers": int(workers),
     }
 
 def is_global_stable(sorted_sym_path, snapshot):

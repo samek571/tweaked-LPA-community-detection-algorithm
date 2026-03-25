@@ -72,7 +72,6 @@ For reproducible runs, keep all of the following fixed:
 
 - `seed`
 - `tie_break="min"`
-- `workers=1`
 - `block_size`
 - input graph
 
@@ -97,7 +96,6 @@ Reproducible results require:
 
 - fixed `seed`
 - `tie_break="min"`
-- `workers=1`
 - fixed `block_size`
 Changing block size or parallelism may change update order and lead to different local optima.
 
@@ -131,7 +129,6 @@ info = stream_lpa(
     block_size=100_000,
     max_sweeps=50,
     seed=1337,
-    workers=1,
     tie_break="min",
 )
 

@@ -6,7 +6,7 @@ from lpkit.stream import (
     symmetrize_and_sort,
     split_sorted_sym_to_blocks,
     init_labels_memmap,
-    stream_multi_sweep_parallel_blocks,
+    stream_multi_sweep_blocks,
 )
 
 BASE    = Path(__file__).resolve().parent
@@ -25,7 +25,7 @@ block_paths = split_sorted_sym_to_blocks(str(SORTED), n=n, block_size=block_size
 init_labels_memmap(str(LABELS), n=n)
 
 t0 = time.time()
-info = stream_multi_sweep_parallel_blocks(
+info = stream_multi_sweep_blocks(
     block_paths,
     str(LABELS),
     n=n,
@@ -34,7 +34,6 @@ info = stream_multi_sweep_parallel_blocks(
     max_sweeps=10,
     min_sweeps=1,
     tie_break="min",
-    workers=1,
 )
 dt = time.time() - t0
 

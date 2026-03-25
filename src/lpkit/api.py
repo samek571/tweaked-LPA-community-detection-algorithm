@@ -16,7 +16,7 @@ from .stream import (
     symmetrize_and_sort,
     split_sorted_sym_to_blocks,
     init_labels_memmap,
-    stream_multi_sweep_parallel_blocks,
+    stream_multi_sweep_blocks,
 )
 
 
@@ -30,7 +30,6 @@ def stream_lpa(
     max_sweeps: int = 50,
     min_sweeps: int = 1,
     tie_break: str = "min",
-    workers: int = 1,
 ) -> dict[str, Any]:
     """Run the full streaming LPA pipeline in one call.
 
@@ -48,7 +47,7 @@ def stream_lpa(
     block_size:
         Approximate number of source-vertex-range edges processed per block.
         This is the primary RAM/throughput tradeoff knob.
-    seed, max_sweeps, min_sweeps, tie_break, workers:
+    seed, max_sweeps, min_sweeps, tie_break:
         Forwarded to the streaming propagation routine.
 
     Returns
@@ -97,7 +96,7 @@ def stream_lpa(
 
         init_labels_memmap(str(out_path), n=n)
 
-        info = stream_multi_sweep_parallel_blocks(
+        info = stream_multi_sweep_blocks(
             block_paths,
             str(out_path),
             n=n,
@@ -106,7 +105,6 @@ def stream_lpa(
             max_sweeps=int(max_sweeps),
             min_sweeps=int(min_sweeps),
             tie_break=tie_break,
-            workers=int(workers),
         )
 
         result = dict(info)

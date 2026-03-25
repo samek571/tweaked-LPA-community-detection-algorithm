@@ -36,7 +36,6 @@ def test_stream_lpa_wrapper_runs_with_explicit_workdir(tmp_path):
         max_sweeps=10,
         min_sweeps=1,
         tie_break="min",
-        workers=1,
     )
 
     assert out.exists()
@@ -79,7 +78,6 @@ def test_stream_lpa_wrapper_matches_ram_partition_on_two_cliques(tmp_path):
         max_sweeps=100,
         min_sweeps=1,
         tie_break="min",
-        workers=1,
     )
 
     assert info["sweeps"] >= 1
@@ -140,7 +138,6 @@ def test_stream_lpa_temp_workdir_still_produces_output_and_is_honest_about_artif
         block_size=3,
         seed=1337,
         max_sweeps=10,
-        workers=1,
         tie_break="min",
     )
 
@@ -169,7 +166,6 @@ def test_stream_lpa_deterministic_on_toy_graph(tmp_path):
         block_size=3,
         seed=1337,
         max_sweeps=50,
-        workers=1,
         tie_break="min",
     )
     stream_lpa(
@@ -179,7 +175,6 @@ def test_stream_lpa_deterministic_on_toy_graph(tmp_path):
         block_size=3,
         seed=1337,
         max_sweeps=50,
-        workers=1,
         tie_break="min",
     )
 

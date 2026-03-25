@@ -6,7 +6,7 @@ variant for sanity checks and convergence comparison.
 
 import numpy as np
 from lpkit.label_propagation import label_propagation
-from lpkit.stream import symmetrize_and_sort, split_sorted_sym_to_blocks, init_labels_memmap, stream_multi_sweep_parallel_blocks
+from lpkit.stream import symmetrize_and_sort, split_sorted_sym_to_blocks, init_labels_memmap, stream_multi_sweep_blocks
 
 
 def groups_from_labels(labels):
@@ -32,7 +32,7 @@ def test_blocked_one_sweep_matches_count(tmp_path):
     block_paths = split_sorted_sym_to_blocks(str(sorted_sym), n=n, block_size=n, out_dir=str(tmp_path / "blocks"))
     init_labels_memmap(str(labels), n=n)
 
-    info = stream_multi_sweep_parallel_blocks(
+    info = stream_multi_sweep_blocks(
         block_paths,
         str(labels),
         n=n,
@@ -41,7 +41,6 @@ def test_blocked_one_sweep_matches_count(tmp_path):
         max_sweeps=1,
         min_sweeps=1,
         tie_break="min",
-        workers=1,
     )
 
     assert info["sweeps"] == 1
@@ -67,7 +66,7 @@ def test_blocked_converges_like_ram(tmp_path):
     block_paths = split_sorted_sym_to_blocks(str(sorted_sym), n=n, block_size=n, out_dir=str(tmp_path / "blocks"))
     init_labels_memmap(str(labels), n=n)
 
-    info = stream_multi_sweep_parallel_blocks(
+    info = stream_multi_sweep_blocks(
         block_paths,
         str(labels),
         n=n,
@@ -76,7 +75,6 @@ def test_blocked_converges_like_ram(tmp_path):
         max_sweeps=100,
         min_sweeps=1,
         tie_break="min",
-        workers=1,
     )
     assert info["sweeps"] >= 1
 
