@@ -364,56 +364,99 @@ def stream_multi_sweep_blocks(
 
     # Monotone helper for locating the first candidate block for a source vertex
     block_max_u_search = [(-1 if x is None else x) for x in block_max_u]
+    block_srcs = [
+        (None if edges.shape[0] == 0 else edges[:, 0])
+        for edges in block_edges
+    ]
+
+    # Lazy cache: once we locate the first occurrence of source u, reuse it in later sweeps.
+    cached_block = np.full(n, -1, dtype=np.int64)
+    cached_lo = np.full(n, -1, dtype=np.int64)
 
     def process_vertex(u: int, sweep_seed: int) -> int | None:
-        """Find vertex u across the sorted block stream, count neighbor labels on the fly,
+        """Locate source u across block files, count neighbor labels on the fly,
         and return the winning new label or None if no change is needed.
         """
         counts: Dict[int, int] = {}
 
-        # Find the first block whose max source is >= u.
-        b = bisect_left(block_max_u_search, u)
-        if b >= num_blocks:
-            return None
+        # Fast path: reuse previously discovered start location for u.
+        if cached_block[u] != -1:
+            b = int(cached_block[u])
+            lo = int(cached_lo[u])
+        else:
+            # Find the first block whose max source is >= u.
+            b = bisect_left(block_max_u_search, u)
+            if b >= num_blocks:
+                return None
+
+            lo = -1
+            while b < num_blocks:
+                if block_min_u[b] is None:
+                    b += 1
+                    continue
+
+                # If the current block starts after u, then no later block can contain u.
+                if block_min_u[b] > u:
+                    return None
+
+                srcs = block_srcs[b]
+                pos = int(np.searchsorted(srcs, u, side="left"))
+
+                if pos < len(srcs) and int(srcs[pos]) == u:
+                    lo = pos
+                    cached_block[u] = b
+                    cached_lo[u] = pos
+                    break
+
+                b += 1
+
+            if lo == -1:
+                return None
 
         found_any = False
 
         while b < num_blocks:
             if block_min_u[b] is None:
                 b += 1
+                lo = 0
                 continue
 
-            # If this block starts after u, then no later block can contain u either.
+            # If block source range is already beyond u, the run is finished globally.
             if block_min_u[b] > u:
                 break
 
             edges = block_edges[b]
-            srcs = edges[:, 0]
+            srcs = block_srcs[b]
 
-            # Find first occurrence of u inside this block.
-            lo = np.searchsorted(srcs, u, side="left")
-
-            # If u is not in this block, move on.
-            if lo >= len(srcs) or int(srcs[lo]) != u:
-                b += 1
-                continue
+            # First block starts at cached/searched lo; continuation blocks start at 0.
+            if not found_any:
+                start = lo
+                if start >= len(srcs) or int(srcs[start]) != u:
+                    break
+            else:
+                start = 0
+                if len(srcs) == 0 or int(srcs[0]) != u:
+                    break
 
             found_any = True
 
-            # Consume the full run of source==u in this block.
-            i = lo
-            while i < len(srcs) and int(srcs[i]) == u:
-                v = int(edges[i, 1])
-                lv = int(labels[v])   # IMPORTANT: live labels => asynchronous semantics
-                counts[lv] = counts.get(lv, 0) + 1
-                i += 1
+            if HAS_CPROP:
+                i = int(_cprop.accumulate_source_run(edges, labels, u, start, counts))
+            else:
+                i = start
+                while i < len(srcs) and int(srcs[i]) == u:
+                    v = int(edges[i, 1])
+                    lv = int(labels[v])   # live labels => asynchronous semantics
+                    counts[lv] = counts.get(lv, 0) + 1
+                    i += 1
 
-            # If we stopped because source changed, then u is finished globally.
+            # If source changed inside this block, u is finished.
             if i < len(srcs):
                 break
 
-            # Otherwise, run may continue into the next consecutive block.
+            # Otherwise the run may continue into the next consecutive block.
             b += 1
+            lo = 0
 
         if not found_any or not counts:
             return None
