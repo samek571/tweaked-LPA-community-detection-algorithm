@@ -26,9 +26,11 @@ Its goal is to answer the questions a reviewer, supervisor, or future maintainer
 
 The streaming path is the primary contribution of the project. It replaces full adjacency residency in RAM with:
 1. preprocessing of the raw edgelist,
-2. sequential disk layout,
-3. block-wise propagation,
-4. memmap-backed label storage.
+2. a source-sorted symmetric edge layout on disk,
+3. block materialization for bounded working-set size,
+4. lightweight per-block source-range metadata,
+5. memmap-backed label storage,
+6. random-order vertex sweeps driven by an oracle permutation.
 
 The project does not introduce a new community objective. It implements a scalable execution model for LPA.
 
@@ -60,20 +62,27 @@ This implementation preserves the same **local update semantics**:
 
 Textbook LPA usually describes an iteration over a **random permutation of vertices**.
 
-Streaming LPKit cannot do that efficiently on huge graphs because random vertex access would require random access to adjacency lists stored on disk. Instead, the streaming implementation uses a **deterministic edge-ordered schedule**:
+A naive streaming implementation cannot do that directly on huge graphs, because random vertex access normally assumes an in-memory adjacency structure. LPKit preserves the randomized vertex schedule while keeping adjacency on disk:
 
 1. symmetrize the graph,
 2. sort edges by source vertex,
-3. split sorted edges into sequential blocks,
-4. process those blocks in order, sweep after sweep.
+3. split the sorted stream into blocks,
+4. for each sweep, draw a random permutation of vertices,
+5. for each vertex `u` in that order:
+    - locate the first block that may contain source `u`,
+    - search inside the block for the first edge of `u`,
+    - scan the contiguous run of edges with source `u`,
+    - if the run reaches the end of the block, continue into the next block,
+    - count neighbor labels on the fly,
+    - update `u` immediately.
 
-So the project preserves the update rule, but replaces:
+So the project preserves the classical **randomized asynchronous vertex schedule**, but changes the storage model:
 
-- **random node schedule**
-with
-- **deterministic block-stream schedule**
+- **from in-memory adjacency**
+  to
+- **source-sorted edge blocks on disk with lightweight metadata**
 
-for engineering reasons, changeing for scalability and disk locality.
+for scalability under limited RAM.
 
 ---
 
@@ -98,20 +107,22 @@ Responsibility:
 ### 5.2 Choosing the vertex processing order
 
 Classical concept:
-- pick an order of vertices, often random in each iteration
+- pick a random order of vertices in each iteration
 
 LPKit methods:
 - `symmetrize_and_sort(in_path, out_path)`
 - `split_sorted_sym_to_blocks(...)`
+- `stream_multi_sweep_blocks(...)`
 
 Responsibilities:
 - convert the graph into an undirected/symmetric form,
-- produce a sorted edge stream,
-- materialize a sequence of on-disk edge blocks
+- produce a source-sorted edge stream,
+- split it into bounded-size blocks,
+- build per-block source-range metadata,
+- generate a fresh random permutation of vertices each sweep,
+- process vertices in that permuted order by locating their adjacency runs across blocks.
 
-The sorted stream defines the effective processing order.
-Vertices are not explicitly permuted.
-They are processed implicitly through the order in which their incident edges appear in the sorted edge stream.
+Unlike the older purely block-sequential design, vertices are now explicitly permuted at sweep level.
 
 ---
 
@@ -200,9 +211,9 @@ Responsibilities:
 - produce `.sorted.sym`
 
 Why it exists:
-- later streaming sweeps require local adjacency access in sequential disk order,
+- later streaming sweeps require fast location of each vertex's contiguous source run,
 - sorted source order groups neighbors coherently,
-- the raw edgelist is not suitable for efficient block streaming.
+- the raw edgelist is not suitable for random-order vertex processing without preprocessing.
 
 #### About the sorting algorithm
 
@@ -215,7 +226,7 @@ The exact external/disk sort algorithm is **not important** to the propagation l
 - after preprocessing, the propagation stage works by scanning blocks and reading/writing labels through a memmap, not by reasoning about the internal mechanics of the sort.
 
 Once that invariant is established, the rest of the algorithm depends on:
-- sequential block traversal,
+- random-order vertex processing over source-sorted block storage,
 - memmap-backed label access,
 - local majority-label computation,
 - sweep-level stopping logic.
@@ -228,35 +239,30 @@ Method:
 - `split_sorted_sym_to_blocks(...)`
 
 Responsibilities:
-- split the sorted symmetric edge stream into contiguous on-disk blocks,
-- return the ordered list of those block paths.
+- split the source-sorted symmetric edge stream into block files,
+- preserve the global source-sorted order across the concatenation of blocks,
+- keep the working set bounded so that only a small portion of the graph must be resident at once.
 
 Why it exists:
-- bounds the in-memory working set,
-- enables one-block-at-a-time processing,
-- makes execution feasible under MemoryMax constraints.
-
-`block_size` is the key tradeoff parameter:
-- smaller blocks -> more files and more filesystem overhead,
-- larger blocks -> higher resident memory pressure and weaker tolerance to tight RAM caps.
+- limits RAM usage,
+- avoids full adjacency residency,
+- provides the storage substrate over which random-order vertex processing can still be implemented.
 
 ---
 
-### 6.4 Label-state initialization
-Method:
-- `init_labels_memmap(path, n)`
+### 6.4 Block metadata
 
-Responsibilities:
-- create the disk-backed labels file,
-- store one label per vertex,
-- initialize with identity labels.
+Inside the propagation routine, LPKit derives lightweight metadata for each block:
 
-Why memmap is used:
-- labels can be much smaller than the edge set but still large,
-- they must remain persistent across sweeps,
-- they should not require full RAM residency.
+- minimum source vertex in the block,
+- maximum source vertex in the block.
 
-This stage is the concrete implementation of `L(v) = v`.
+This metadata is used to locate the first candidate block for a requested vertex `u`.
+
+The metadata is intentionally lightweight:
+- it avoids indexing every edge globally,
+- it does not change the external storage format,
+- it allows the implementation to preserve the existing block-based architecture.
 
 ---
 
@@ -266,15 +272,45 @@ Method:
 - `stream_multi_sweep_blocks(...)`
 
 Responsibilities:
-- iterate over the block list repeatedly,
-- load block data,
-- read current labels,
-- compute new labels,
-- write updates immediately,
+- draw a fresh random permutation of vertices each sweep,
+- for each vertex `u` in that order:
+    - locate the first block that may contain source `u`,
+    - search inside the block for the first occurrence of `u`,
+    - scan the contiguous run of edges with source `u`,
+    - continue into following blocks if the run spans block boundaries,
+    - count neighbor labels on the fly,
+    - choose the winning plurality label,
+    - update `u` immediately,
 - count changes,
 - decide whether another sweep is needed.
 
+This is an asynchronous random-order streaming implementation built on top of block files.
+
 ---
+
+### 6.6 Multi-sweep propagation
+
+Method:
+- `stream_multi_sweep_blocks(...)`
+
+Responsibilities:
+- draw a fresh random permutation of vertices each sweep,
+- for each vertex `u` in that order:
+    - locate the first block that may contain `u`,
+    - search inside the block for `u`,
+    - scan the contiguous run of edges with source `u`,
+    - continue into following blocks if the run spans block boundaries,
+    - count neighbor labels on the fly,
+    - choose the winning plurality label,
+    - update `u` immediately,
+- count changes,
+- decide whether another sweep is needed.
+
+This is an asynchronous random-order streaming implementation built on top of block files.
+
+---
+
+## 7. How vertices are actually selected for processing
 
 ## 7. How vertices are actually selected for processing
 
@@ -286,28 +322,38 @@ In the classical asynchronous description, vertices are processed in a random or
 
 ### 7.2 LPKit streaming mode
 
-In LPKit streaming mode, vertices are not selected by an explicit vertex permutation. They are selected **implicitly** by the sorted edge order.
+In LPKit streaming mode, vertices are also processed in an explicit random order in each sweep.
 
-The effective schedule is:
+The implementation does **not** process blocks as the scheduling unit anymore. Instead:
+
+1. the graph is stored as a source-sorted symmetric edge stream split into blocks,
+2. each sweep samples a random permutation of all vertices,
+3. for each vertex `u` in that order:
+    - the block metadata is used to locate the first candidate block,
+    - the block is searched for the first occurrence of source `u`,
+    - the source run is scanned,
+    - if needed, scanning continues seamlessly into following blocks until the source changes.
+
+So the effective schedule is:
 
 ```text
 for each sweep:
-    for each block in block_paths:
-        process vertices represented by edges in that block
+    permute vertices randomly
+    for u in permutation:
+        locate block containing u
+        scan adjacency run of u
+        count neighbor labels
+        update u immediately
 ```
-Because edges are sorted by source vertex id, the effective order is approximately ascending source-vertex order, block by block.
-
-That means:
-- the implementation is deterministic under fixed seed, fixed block size, fixed worker count, and fixed tie-breaking;
-- the implementation is still asynchronous, because a label updated earlier in a sweep can influence later updates within that same sweep;
-- the implementation is not “random-order LPA.”
 
 ### 7.3 Why this matters
 This explains several observed properties:
-- changing block_size can change the final partition,
-- changing worker count can change outcomes,
-- deterministic settings are required for reproducible comparisons,
-- streaming mode may reach a different valid local equilibrium than a random-order RAM implementation.
+- update order can influence which local optimum is reached,
+- tie-breaking remains important for reproducibility,
+- the implementation keeps storage block-based while making scheduling vertex-based,
+- wall-clock time may suffer from weaker locality than purely sequential block scans.
+
+--- 
 
 ## 8. Correctness model
 
@@ -321,7 +367,7 @@ In this project, correctness means:
 - labels are updated asynchronously during a sweep,
 - stopping conditions are applied consistently,
 - output labels define a valid partition of the graph,
-- streaming mode preserves the semantic spirit of LPA while using a different scheduling discipline.
+- streaming mode preserves the semantic spirit of asynchronous random-order LPA while using a block-based disk storage discipline.
 
 ### 8.2 What correctness does not mean
 
@@ -339,7 +385,8 @@ Reproducibility in this project requires:
 
 - fixed `seed`,
 - deterministic tie-breaking, typically `tie_break="min"`,
-- fixed `block_size`,
+- identical source-sorted symmetric file,
+- identical block split and block ordering.
 - identical input graph.
 
 This is not an implementation error. It is a structural consequence of asynchronous label propagation.
@@ -351,7 +398,6 @@ This is not an implementation error. It is a structural consequence of asynchron
 It is not a separate algorithm. It is a **coordinator** over the lower-level streaming pipeline.
 
 Logical call graph:
-
 `
 stream_lpa(...)
     -> symmetrize_and_sort(...)
@@ -359,14 +405,14 @@ stream_lpa(...)
     -> init_labels_memmap(...)
     -> stream_multi_sweep_blocks(...)
 `
-
 Responsibilities of the wrapper:
 - validate arguments,
 - manage temporary or explicit work directories,
 - create and organize intermediate artifacts,
-- run the full streaming pipeline,
+- run the full block-based random-order streaming pipeline,
 - return metadata needed by callers.
-- For Python integration, this is the intended one-line public API.
+
+For Python integration, this is the intended one-line public API.
 
 ## 11. Runtime analysis
 
@@ -399,6 +445,7 @@ Total runtime is: `Θ(m log m) + Θ(S · m)`
 
 Interpretation:
 - first execution is often dominated by sort and block materialization,
+- later sweeps are dominated by repeated block lookups and adjacency-run scans.
 - if `S` is modest, runtime after preprocessing is near-linear in `m`,
 - if `S` is large, repeated sweeps dominate.
 
@@ -419,15 +466,18 @@ In pathological settings, the propagation part can trend toward many full passes
 ### 12.1 RAM
 
 In streaming mode, the intended working set is bounded by:
-- one in-memory block of edges: approximately `Θ(block_size)`
-- memmap access window over labels
-- small temporary counting buffers
+- labels memmap access window,
+- one or a few currently loaded blocks,
+- lightweight per-block source-range metadata,
+- one temporary counting dictionary for the currently processed vertex.
 
-Peak resident memory therefore depends primarily on:
-- `block_size`,
-- OS page-cache behavior,
-- degree distribution,
-- implementation overhead in local counting.
+For a vertex `u`, temporary counting memory is:
+
+- `O(number of distinct neighbor labels of u)`
+
+not `O(deg(u))` in the common case.
+
+In the worst case, if every neighbor of `u` has a different label, this still becomes `O(deg(u))`.
 
 ### 12.2 Disk
 
@@ -437,7 +487,7 @@ Streaming mode may materialize:
 - block directory,
 - labels memmap.
 
-Disk usage may exceed several multiples of the raw graph size.
+Disk usage may exceed several multiples of the raw graph size. This is expected because the project deliberately trades disk storage for reduced RAM usage.
 
 ## 13. Analysis of problematic subparts
 
@@ -453,30 +503,37 @@ Sorting is expensive because:
 
 However, once sorting is complete, it is no longer central to the propagation logic. The algorithmic behavior of LPKit after preprocessing depends on the **sorted layout**, not on how the sort was internally implemented.
 
-### 13.2 Very small block sizes
+### 13.2 Random vertex order vs block locality
 
-Too-small blocks cause:
+The current implementation preserves a random vertex processing order, but storage is still block-based.
 
-- too many files,
-- frequent block transitions,
-- more filesystem overhead,
-- weaker throughput.
+This means:
+- the logical propagation work stays linear in `m`,
+- but wall-clock time may be hurt by jumping between distant source runs,
+- blocks may be re-opened or revisited multiple times within the same sweep,
+- SSD-backed execution is much more suitable than HDD-backed execution.
 
-This increases wall-clock time without improving algorithmic correctness.
+This is the main practical cost of combining random-order scheduling with block-based storage.
 
-### 13.3 Very large block sizes
+### 13.3 Cross-block source runs
 
-Very large blocks:
+A high-degree vertex may have its source run span multiple consecutive blocks.
 
-- reduce file-count overhead,
-- but increase resident memory pressure,
-- and make MemoryMax failures more likely.
+The implementation must therefore:
+- detect the first block containing the vertex,
+- continue scanning into following blocks while the source remains unchanged.
+
+This is required for correctness and is not an edge case for hub-heavy graphs.
 
 ### 13.4 High-degree vertices
 
 Vertices with huge neighborhoods are expensive because their update step must count many neighboring labels.
 
-These vertices can dominate local runtime even if the rest of the graph is sparse.
+Even though the implementation no longer stores full neighbor lists explicitly, the counting dictionary may still grow to:
+
+- `O(number of distinct neighbor labels)`
+
+and in the worst case this is still `O(deg(u))`.
 
 ### 13.5 Strict convergence threshold
 
@@ -501,13 +558,12 @@ Example style of output:
 `[STREAM(bs=50000)] n=36692 communities=2710 sweeps=100 converged=0 time=0.585s`
 
 Meaning of fields:
-
-- `bs` -> block size used in this run
 - `n` -> number of vertices
 - `communities` -> number of distinct final labels
 - `sweeps` -> number of completed sweeps
 - `converged` -> whether the stopping criterion was satisfied before budget exhaustion
 - `time` -> measured execution time reported by the streaming pipeline
+- `bs` -> block size used when the current block-based streaming mode is active
 
 **What converged=0 means**
 - sweep budget was exhausted,

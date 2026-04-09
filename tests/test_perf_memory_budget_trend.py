@@ -58,7 +58,6 @@ def test_memory_budget_trend(tmp_path: Path) -> None:
 
     n = int(os.getenv("LPKIT_PERF_N", "100000"))
     m = int(os.getenv("LPKIT_PERF_M", "300000"))
-    block_size = int(os.getenv("LPKIT_PERF_BLOCK_SIZE", "5000"))
     max_sweeps = int(os.getenv("LPKIT_PERF_MAX_SWEEPS", "50"))
     repeats = int(os.getenv("LPKIT_PERF_REPEATS", "3"))
     seed = int(os.getenv("LPKIT_PERF_SEED", "1337"))
@@ -72,8 +71,13 @@ def test_memory_budget_trend(tmp_path: Path) -> None:
     generate_large_graph(str(raw), n=n, m=m, topology="random", seed=987654)
 
     venv = os.environ.get("VIRTUAL_ENV")
-    venv_bin = Path(venv) / "bin" if venv else Path(sys.executable).resolve().parent
-    python = (venv_bin / "python").resolve()
+    if venv:
+        venv_bin = Path(venv) / "bin"
+        python = (venv_bin / "python").resolve()
+    else:
+        python = Path(sys.executable).resolve()
+        venv_bin = python.parent
+
     env_path = f"{venv_bin}:{os.environ.get('PATH','')}"
     env_pp = [str(repo_root)]
     if (repo_root / "src").is_dir():
@@ -114,8 +118,6 @@ def test_memory_budget_trend(tmp_path: Path) -> None:
             str(out_labels),
             "--max-sweeps",
             str(max_sweeps),
-            "--block-size",
-            str(block_size),
             "--seed",
             str(seed),
         ]

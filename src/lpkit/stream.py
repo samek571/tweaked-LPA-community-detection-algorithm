@@ -24,6 +24,7 @@ import numpy as np
 import struct
 from random import Random
 from pathlib import Path
+from bisect import bisect_left
 from typing import Iterator, Optional, Tuple, Dict
 
 try:
@@ -304,14 +305,20 @@ def stream_multi_sweep_blocks(
         min_sweeps: int = 1,
         tie_break: str = "random",
     ) -> Dict[str, int]:
-    """Run streaming LPA sweeps over pre-split block files.
+    """Run streaming LPA sweeps over pre-split source-sorted block files.
 
     Execution model (per sweep)
     ---------------------------
-    1. Snapshot current labels into RAM (`snapshot`).
-    2. Process blocks in a shuffled order sequentially
-    3. For each block, compute label updates using the snapshot.
-    4. Apply updates to the labels memmap and flush.
+    1. Ask the oracle for a random permutation of vertices.
+    2. For each vertex `u` in that order:
+       - locate the first block that may contain `u`,
+       - search inside the block for the first occurrence of source `u`,
+       - scan the contiguous run of edges with source `u`,
+       - if the run reaches the end of the block, continue seamlessly into following blocks,
+       - count neighbor labels on the fly,
+       - assign the winning plurality label to `u` immediately.
+
+    This is an asynchronous random-order update scheme.
 
     Convergence
     -----------
@@ -323,9 +330,11 @@ def stream_multi_sweep_blocks(
 
     Notes
     -----
-    - Different `block_size`, `workers`, and tie-breaking can change update order and
-      lead to different local optima (valid but not identical partitions).
-    - singlethread sequential block processing to keep the sweep semantics deterministic
+    - Only block files are materialized in RAM; full adjacency is never built.
+    - Temporary per-vertex memory is the label-frequency dictionary for the currently
+      processed vertex.
+    - High-degree vertices may still be expensive because their source run can span
+      many edges and possibly multiple consecutive blocks.
     """
     if block_size is None:
         block_size = 5000
@@ -334,91 +343,109 @@ def stream_multi_sweep_blocks(
     num_blocks = len(block_paths)
     total_updates, done= 0, False
 
-    def tb_code():
-        """Map tie-break mode to the integer codes expected by the Cython kernel."""
-        if tie_break == "min": return 1
-        if tie_break == "max": return 2
-        return 0
-    TB = tb_code()
+    # Load block memmaps once and store source-range metadata.
+    block_edges = []
+    block_min_u = []
+    block_max_u = []
 
-    def process_block(block_idx: int, sweep_seed: int) -> Dict[int, int]:
-        """Compute updates for a single block using the current sweep snapshot.
-
-        This returns a sparse mapping `{vertex: new_label}`. The actual memmap writes
-        are applied by the caller so update accounting stays centralized.
-
-        if Cython kernel (_cprop.lpa_block) is available, we use it for like massive improvements
-        python fallback: block file is already sorted so we maintain only label frequency map for inspected vertex
-        hence we avoid storing all neighbor vertex ids in ram, only labels will suffice improving memory complexity
-        (time complexity stays the same as we need to check trough all of them)
-        """
-        path = block_paths[block_idx]
+    for path in block_paths:
         data = np.memmap(path, mode="r", dtype=np.uint32)
         if data.size == 0:
-            return {}
+            edges = data.reshape(0, 2)
+            block_edges.append(edges)
+            block_min_u.append(None)
+            block_max_u.append(None)
+            continue
 
         edges = data.reshape(-1, 2)
+        block_edges.append(edges)
+        block_min_u.append(int(edges[0, 0]))
+        block_max_u.append(int(edges[-1, 0]))
 
-        # fast path: Cython kernel, no Python preprocessing (consumes raw edges + snapshot directly)
-        if HAS_CPROP:
-            return _cprop.lpa_block(edges, snapshot, TB, sweep_seed + block_idx)
+    # Monotone helper for locating the first candidate block for a source vertex
+    block_max_u_search = [(-1 if x is None else x) for x in block_max_u]
 
+    def process_vertex(u: int, sweep_seed: int) -> int | None:
+        """Find vertex u across the sorted block stream, count neighbor labels on the fly,
+        and return the winning new label or None if no change is needed.
+        """
+        counts: Dict[int, int] = {}
 
-        updates: Dict[int, int] = {}
-        current_u: int | None = None
-        cnts: Dict[int, int] = {}
+        # Find the first block whose max source is >= u.
+        b = bisect_left(block_max_u_search, u)
+        if b >= num_blocks:
+            return None
 
-        def _finalize_vertex(u: int, counts: Dict[int, int]) -> None:
-            """Choose the plurality label for one vertex and stage an update if needed."""
-            if not counts:
-                return
+        found_any = False
 
-            max_cnt = max(cnts.values())
-            if tie_break == "min":
-                new_lab = min([lab for lab, c in cnts.items() if c == max_cnt])
-            elif tie_break == "max":
-                new_lab = max([lab for lab, c in cnts.items() if c == max_cnt])
-            else:
-                r = Random(sweep_seed + u)
-                cands = [lab for lab, c in cnts.items() if c == max_cnt]
-                new_lab = r.choice(cands)
+        while b < num_blocks:
+            if block_min_u[b] is None:
+                b += 1
+                continue
 
-            if new_lab != int(snapshot[u]):
-                updates[u] = new_lab
+            # If this block starts after u, then no later block can contain u either.
+            if block_min_u[b] > u:
+                break
 
+            edges = block_edges[b]
+            srcs = edges[:, 0]
 
-        for u_raw, v_raw in edges:
-            u = int(u_raw)
-            v = int(v_raw)
+            # Find first occurrence of u inside this block.
+            lo = np.searchsorted(srcs, u, side="left")
 
-            if current_u is None:
-                current_u = u
+            # If u is not in this block, move on.
+            if lo >= len(srcs) or int(srcs[lo]) != u:
+                b += 1
+                continue
 
-            if u != current_u:
-                _finalize_vertex(current_u, cnts)
-                cnts.clear()
-                current_u = u
+            found_any = True
 
-            lv = int(snapshot[v])
-            cnts[lv] = cnts.get(lv, 0) + 1
+            # Consume the full run of source==u in this block.
+            i = lo
+            while i < len(srcs) and int(srcs[i]) == u:
+                v = int(edges[i, 1])
+                lv = int(labels[v])   # IMPORTANT: live labels => asynchronous semantics
+                counts[lv] = counts.get(lv, 0) + 1
+                i += 1
 
-        if current_u is not None:
-            _finalize_vertex(current_u, cnts)
+            # If we stopped because source changed, then u is finished globally.
+            if i < len(srcs):
+                break
 
-        return updates
+            # Otherwise, run may continue into the next consecutive block.
+            b += 1
+
+        if not found_any or not counts:
+            return None
+
+        max_cnt = max(counts.values())
+
+        if tie_break == "min":
+            new_lab = min(lab for lab, c in counts.items() if c == max_cnt)
+        elif tie_break == "max":
+            new_lab = max(lab for lab, c in counts.items() if c == max_cnt)
+        else:
+            r = Random(sweep_seed + u)
+            cands = [lab for lab, c in counts.items() if c == max_cnt]
+            new_lab = r.choice(cands)
+
+        if new_lab != int(labels[u]):
+            return int(new_lab)
+
+        return None
 
 
     for s in range(1, max_sweeps + 1):
         print(f"\r[sweep {s}/{max_sweeps}] running...", end="", flush=True)
 
-        snapshot = np.asarray(labels, dtype=np.int64) # decouples read labels (this sweep) from writes
         rng = Random(seed + s)
-        block_order = list(range(num_blocks))
-        rng.shuffle(block_order)
+        vertex_order = list(range(n))
+        rng.shuffle(vertex_order)
         updated_this = 0
-        for b in block_order:
-            block_updates = process_block(b, seed + s * 1000003)
-            for u, new_lab in block_updates.items():
+
+        for u in vertex_order:
+            new_lab = process_vertex(u, seed + s * 1000003)
+            if new_lab is not None:
                 labels[u] = new_lab
                 updated_this += 1
 
@@ -440,50 +467,3 @@ def stream_multi_sweep_blocks(
         "n": int(n),
         "block_size": int(block_size) if block_size is not None else -1,
     }
-
-def is_global_stable(sorted_sym_path, snapshot):
-    """Check global LPA stability by scanning a sorted symmetric edgelist.
-
-    This is an expensive verification helper used for diagnostics / experiments,
-    not in the main fast path.
-    """
-    with open(sorted_sym_path, "r") as f:
-        last_u = None
-        neighbor_labels = []
-
-        for line in f:
-            u, v = map(int, line.split())
-
-            if last_u is None:
-                last_u = u
-
-            if u != last_u:
-                #evaluate stability for last_u
-                if not is_vertex_stable(last_u, neighbor_labels, snapshot):
-                    return False
-                last_u = u
-                neighbor_labels = []
-
-            neighbor_labels.append(snapshot[v])
-
-        if last_u is not None:
-            if not is_vertex_stable(last_u, neighbor_labels, snapshot):
-                return False
-
-    return True
-
-
-def is_vertex_stable(u, neigh_labels, snapshot):
-    """Return whether vertex `u` already holds a maximal-frequency neighbor label."""
-    #max degr is small == python sufficies
-    cnt = {}
-    for L in neigh_labels:
-        cnt[L] = cnt.get(L, 0) + 1
-
-    if not cnt:
-        return True
-
-    max_count = max(cnt.values())
-    my_label = snapshot[u]
-    my_count = cnt.get(my_label, 0)
-    return my_count >= max_count

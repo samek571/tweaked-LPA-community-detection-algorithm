@@ -1,0 +1,263 @@
+Metadata-Version: 2.4
+Name: lpkit
+Version: 0.1.0
+Summary: Waaay too big Graph & not enough RAM => near linear time complexity solution
+Author: Samuel Vasko
+License-Expression: MIT
+Project-URL: Homepage, https://TODO.com
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: numpy
+Requires-Dist: scipy
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+
+## 1. Overview
+
+`lpkit` implements scalable Label Propagation Algorithm (LPA) for community detection on large graphs.
+
+It supports:
+- In-memory LPA for small/medium graphs
+- a one-call Python API for streaming runs,
+- Disk-backed streaming LPA for graphs too large to fit into RAM
+- CLI commands for both RAM and streaming execution,
+- tests for correctness, API behavior, and constrained-memory execution.
+
+For the full algorithm and implementation specification, see [`docs/DEV_README.md`](docs/DEV_README.md).
+
+## 2. Set-up
+### Install and venv setup
+`python3 -m venv .venv` \
+`source .venv/bin/activate`
+- if `python3 -m venv` gives an error, install it: `sudo apt install python3-venv`
+
+`pip install -e .` (registers lpkit)
+
+### Run Pre-Made Tests
+`PYTHONPATH=src pytest -q` or simply `pytest -q` (thanks to existing `.ini` file)
+
+### Example run
+```sh
+lpkit stream --in path/to/big_graph.edgelist \
+             --out labels.npy \
+             --seed 1337 \
+             --max-sweeps 100 \
+             --block-size 50000
+```
+Output:
+```[STREAM(bs=50000)] n=36692 communities=2710 sweeps=100 converged=0 time=0.585s```
+
+### refer to manual
+`lpkit --help`\
+`lpkit ram --help`\
+`lpkit stream --help`
+
+## 3. Detailed Pipeline Description
+### 3.1 Input Format
+
+Input must be a 2-column whitespace-separated edgelist:
+```
+u1 v1
+u2 v2
+...
+```
+- comment lines beginning with `#` are ignored,
+- streaming mode symmetrizes the graph internally,
+- the graph may therefore be provided as directed in the raw input.
+
+### 3.2 Important behavior
+
+This project implements the **LPA update rule**, but the streaming version does **not** use the textbook random-permutation schedule.
+
+Instead, streaming mode uses a deterministic block-stream schedule:
+
+- edges are sorted by source vertex,
+- blocks are processed sequentially,
+- updates are applied asynchronously during a sweep.
+
+This matters because:
+
+- different valid runs can end in different local equilibria,
+- changing `block_size` can change the final partition,
+- changing `workers` can change the final partition,
+- streaming output does not have to match a RAM run exactly on every graph.
+
+For reproducible runs, keep all of the following fixed:
+
+- `seed`
+- `tie_break="min"`
+- `block_size`
+- input graph
+
+
+### 3.3 Design Guarantees
+
+The streaming pipeline maintains the following invariants:
+
+- Labels are stored in a contiguous `uint64` NumPy memmap of size `n`.
+- The full adjacency is never loaded into RAM in streaming mode.
+- At any time, only a single block of edges is processed in memory.
+- Peak RAM usage is approximately:
+
+  O(block_size) + O(label working window)
+
+- Disk is used as the primary storage medium for adjacency.
+- If execution completes successfully (i.e., not killed by OOM), the output is a valid LPA partition under the chosen update order and tie-breaking rule.
+
+#### Determinism Conditions
+
+Reproducible results require:
+
+- fixed `seed`
+- `tie_break="min"`
+- fixed `block_size`
+Changing block size or parallelism may change update order and lead to different local optima.
+
+
+## 4. Recommended Usage Patterns
+
+### Small graph (<1M edges)
+
+`lpkit stream --block-size n`
+or use in-memory `label_propagation`
+
+### Medium graph (1M–100M edges)
+`--block-size 100k–5M`
+### Very large graph (>100M edges)
+```text
+--block-size millions
+low initial max_sweeps
+increase gradually
+```
+## 5. Programmatic API Usage (One-Line Wrapper)
+
+The streaming pipeline can also be used directly from Python:
+For library usage, `lpkit` can be used from Python through a high-level wrapper:
+
+```python
+from lpkit import stream_lpa
+
+info = stream_lpa(
+    "graph.edgelist",
+    "labels.npy",
+    block_size=100_000,
+    max_sweeps=50,
+    seed=1337,
+    tie_break="min",
+)
+
+print(info)
+```
+
+## 6. Test Coverage Summary
+- `test_basic.py`: correctness on small graphs.
+- `test_api_wrapper.py`: one-call Python API behavior.
+- `test_stream.py`: streaming $\epsilon$-equivalence to in-memory.
+- `test_compare_hdd_vs_ram.py`: streaming vs RAM on larger graphs.
+- `test_perf_memory_budget_trend.py`: behavior under MemoryMax.
+
+Performance tests are gated behind:
+` LPKIT_RUN_PERF=1`
+
+## 7. Conceptual Pipeline
+1. raw edgelist
+2. symmetrize + sort
+3. split into blocks
+4. initialize labels (memmap)
+5. multi-sweep label propagation
+6. labels.npy (final communities)
+
+The streaming pipeline is designed for graphs with:
+- millions of vertices
+- hundreds of millions to billions of edges
+- limited availability of RAM size
+
+
+## 8. Algorithmic Properties
+### 8.1 Time Complexity
+
+Let:
+- n = vertices
+- m = edges
+- S = number of sweeps
+
+Total runtime decomposes into:
+
+- $\Theta(m)$ input scan / symmetrization
+- $\Theta(m log m)$ external sort (dominant preprocessing cost, heavily I/O-bound)
+- $\Theta(m)$ block splitting
+- $\Theta(S * m)$ streaming label propagation sweeps
+
+Overall cost is: $\Theta(m log m)$ + $\Theta(S * m)$
+
+#### Practical interpretation
+
+- The first execution is usually dominated by sorting and block materialization.
+- If `S` is small (typical range: 10–50 sweeps), runtime after preprocessing is close to linear in `m`.
+- If `S` is large, repeated full sweeps dominate.
+
+#### Worst case / problematic behavior
+
+In pathological cases (e.g., unstable near-ties or slow-moving labels), convergence may require many sweeps, so runtime trends toward $\Theta(S * m)$ with large $S$.
+This is why `max_sweeps` is an important operational guardrail.
+
+### 8.2 Space Complexity
+
+#### RAM
+
+- Labels memmap metadata / access window: `Θ(n)` logical state (OS-paged)
+- One in-memory edge block: `Θ(block_size)`
+- Temporary buffers and bookkeeping: implementation-dependent, but small relative to edge storage
+
+Peak resident memory is therefore controlled primarily by `block_size` and the OS page cache behavior.
+
+#### Disk
+
+Streaming mode may materialize:
+
+- raw edgelist
+- sorted symmetric edgelist (`.sorted.sym`)
+- block files (`.blocks/`)
+- labels memmap (`labels.npy`)
+
+For very large graphs, total disk footprint can exceed **3–5×** the raw edgelist size.  
+This is expected due to symmetrization, sorting, and block materialization.
+
+## 9. Memory-Constrained Execution
+
+Run under memory cap:
+```sh
+systemd-run --user --scope -p MemoryMax=512M 
+lpkit stream ...
+```
+
+Behavior regimes:
+1. Working set fits → runtime may remain almost unchanged.
+2. Slightly exceeds → paging → slower.
+3. Strongly exceeds → OOM kill.
+
+If process completes, result is valid.
+If killed, memory cap too tight.
+
+## 10. When to read `DEV_README`
+
+Use this `README.md` for:
+
+- repository overview,
+- installation,
+- quick usage,
+- CLI and Python entry points,
+- operational expectations.
+
+Use `docs/DEV_README.md` for:
+
+- implementation semantics,
+- method responsibilities,
+- invariants,
+- correctness model,
+- runtime and space analysis in maintainer detail,
+- reviewer-facing explanation of design choices.
+
+## Disclaimer
+1. No windows support, dev is doing linux. Some things might now work such as external sort or newest python internal methods might not be compatible with older versions of windows...
+2. This is my Semestral project at MFF UK, under supervision of David Hartman.
