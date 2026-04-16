@@ -177,9 +177,10 @@ def build_vertex_index(
     offsets.flush()
     degrees.flush()
 
-
-def init_labels_memmap(path: str, *, n: int, dtype=np.uint64) -> np.memmap:
+def init_labels_memmap(path: str, *, n: int, dtype=None) -> np.memmap:
     """Create label storage as a `.npy` memmap initialized to identity labels."""
+    if dtype is None:
+        dtype = np.uint32 if n <= np.iinfo(np.uint32).max else np.uint64
     mm = np.lib.format.open_memmap(path, mode="w+", dtype=dtype, shape=(n,))
     mm[:] = np.arange(n, dtype=dtype)
     return mm
@@ -368,51 +369,58 @@ def stream_multi_sweep_blocks(
         (None if edges.shape[0] == 0 else edges[:, 0])
         for edges in block_edges
     ]
+    # Precompute the first block and first local index for each source vertex that appears.
+    first_block_of = np.full(n, -1, dtype=np.int64)
+    first_pos_in_block = np.full(n, -1, dtype=np.int64)
 
-    # Lazy cache: once we locate the first occurrence of source u, reuse it in later sweeps.
-    cached_block = np.full(n, -1, dtype=np.int64)
-    cached_lo = np.full(n, -1, dtype=np.int64)
+    for b, edges in enumerate(block_edges):
+        if edges.shape[0] == 0:
+            continue
+        srcs = edges[:, 0]
+        prev = None
+        for i, u_raw in enumerate(srcs):
+            u = int(u_raw)
+            if u != prev:
+                if first_block_of[u] == -1:
+                    first_block_of[u] = b
+                    first_pos_in_block[u] = i
+                prev = u
+
+    def tb_code() -> int:
+        if tie_break == "min":
+            return 1
+        if tie_break == "max":
+            return 2
+        return 0
+
+    TB = tb_code()
 
     def process_vertex(u: int, sweep_seed: int) -> int | None:
-        """Locate source u across block files, count neighbor labels on the fly,
-        and return the winning new label or None if no change is needed.
-        """
+        """Locate source u across block files, count neighbor labels, and return new label or None."""
+        start_block = int(first_block_of[u])
+        if start_block == -1:
+            return None
+
+        start_pos = int(first_pos_in_block[u])
+
+        if HAS_CPROP:
+            new_lab = int(
+                _cprop.lpa_vertex_from_blocks(
+                    block_edges,
+                    block_min_u,
+                    labels,
+                    u,
+                    start_block,
+                    start_pos,
+                    TB,
+                    sweep_seed,
+                )
+            )
+            return None if new_lab < 0 else new_lab
+
         counts: Dict[int, int] = {}
-
-        # Fast path: reuse previously discovered start location for u.
-        if cached_block[u] != -1:
-            b = int(cached_block[u])
-            lo = int(cached_lo[u])
-        else:
-            # Find the first block whose max source is >= u.
-            b = bisect_left(block_max_u_search, u)
-            if b >= num_blocks:
-                return None
-
-            lo = -1
-            while b < num_blocks:
-                if block_min_u[b] is None:
-                    b += 1
-                    continue
-
-                # If the current block starts after u, then no later block can contain u.
-                if block_min_u[b] > u:
-                    return None
-
-                srcs = block_srcs[b]
-                pos = int(np.searchsorted(srcs, u, side="left"))
-
-                if pos < len(srcs) and int(srcs[pos]) == u:
-                    lo = pos
-                    cached_block[u] = b
-                    cached_lo[u] = pos
-                    break
-
-                b += 1
-
-            if lo == -1:
-                return None
-
+        b = start_block
+        lo = start_pos
         found_any = False
 
         while b < num_blocks:
@@ -421,14 +429,12 @@ def stream_multi_sweep_blocks(
                 lo = 0
                 continue
 
-            # If block source range is already beyond u, the run is finished globally.
             if block_min_u[b] > u:
                 break
 
             edges = block_edges[b]
-            srcs = block_srcs[b]
+            srcs = edges[:, 0]
 
-            # First block starts at cached/searched lo; continuation blocks start at 0.
             if not found_any:
                 start = lo
                 if start >= len(srcs) or int(srcs[start]) != u:
@@ -446,15 +452,13 @@ def stream_multi_sweep_blocks(
                 i = start
                 while i < len(srcs) and int(srcs[i]) == u:
                     v = int(edges[i, 1])
-                    lv = int(labels[v])   # live labels => asynchronous semantics
+                    lv = int(labels[v])
                     counts[lv] = counts.get(lv, 0) + 1
                     i += 1
 
-            # If source changed inside this block, u is finished.
             if i < len(srcs):
                 break
 
-            # Otherwise the run may continue into the next consecutive block.
             b += 1
             lo = 0
 

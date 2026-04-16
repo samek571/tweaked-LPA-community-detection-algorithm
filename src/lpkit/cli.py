@@ -147,7 +147,7 @@ def run_stream(args) -> int:
 
     #4) summarize
     mm = np.lib.format.open_memmap(labels_path, mode="r+")
-    _summarize(mm, info, took, f"STREAM(bs={block_size})")
+    _summarize(mm, info, took, "STREAM(random-vertex-blocks)")
 
     if Path(args.out_path).suffix != ".npy":
         _write_labels(mm, args.out_path)

@@ -1,6 +1,7 @@
 import numpy as np
 cimport numpy as np
 from libc.stdint cimport uint32_t, int64_t, uint64_t
+from random import Random
 
 #tie_break: 0 = first, 1 = min, 2 = max
 #returns dict[u -> new_label]
@@ -86,9 +87,10 @@ def lpa_block(
     finalize()
     return result
 
+
 def accumulate_source_run(
         edges,           # numpy array (m,2) uint32
-        labels_live,     # numpy array / memmap (n,) uint64
+        labels_live,     # numpy array / memmap (n,) uint32
         unsigned int target_u,
         Py_ssize_t start_idx,
         dict counts):
@@ -99,14 +101,14 @@ def accumulate_source_run(
     This is used by the oracle-permuted block-based streaming path.
     """
     cdef np.ndarray[np.uint32_t, ndim=2] edges_arr = edges
-    cdef np.ndarray[np.uint64_t, ndim=1] labels_arr = labels_live
+    cdef np.ndarray[np.uint32_t, ndim=1] labels_arr = labels_live
 
     cdef const uint32_t[:, :] e = edges_arr
-    cdef const uint64_t[:] lab = labels_arr
+    cdef const uint32_t[:] lab = labels_arr
 
     cdef Py_ssize_t m = e.shape[0]
     cdef Py_ssize_t i = start_idx
-    cdef uint64_t lv
+    cdef uint32_t lv
 
     while i < m and e[i, 0] == target_u:
         lv = lab[e[i, 1]]
@@ -114,3 +116,97 @@ def accumulate_source_run(
         i += 1
 
     return i
+
+
+def lpa_vertex_from_blocks(
+        block_edges,      # Python list of numpy arrays (m_i, 2) uint32
+        block_min_u,      # Python list[int|None]
+        labels_live,      # numpy array / memmap (n,) uint32
+        unsigned int target_u,
+        Py_ssize_t start_block,
+        Py_ssize_t start_pos,
+        int tie_break,    # 0=random, 1=min, 2=max
+        unsigned long long sweep_seed):
+    """
+    Process one source vertex across consecutive blocks and return the chosen new label.
+    Returns -1 if the vertex is absent or its label does not change.
+    """
+    cdef np.ndarray[np.uint32_t, ndim=1] labels_arr = labels_live
+    cdef const uint32_t[:] lab = labels_arr
+
+    cdef dict counts = {}
+    cdef Py_ssize_t b = start_block
+    cdef Py_ssize_t i, m
+    cdef int found_any = 0
+    cdef object edges_arr_obj
+    cdef np.ndarray[np.uint32_t, ndim=2] edges_arr
+    cdef const uint32_t[:, :] e
+    cdef int src_min
+    cdef uint32_t lv
+    cdef int max_cnt
+    cdef uint32_t new_lab
+    cdef uint32_t old_lab
+    cdef object cands
+    cdef object rng
+    cdef object item
+
+    while b < len(block_edges):
+        if block_min_u[b] is None:
+            b += 1
+            start_pos = 0
+            continue
+
+        src_min = block_min_u[b]
+        if src_min > target_u:
+            break
+
+        edges_arr_obj = block_edges[b]
+        edges_arr = edges_arr_obj
+        e = edges_arr
+        m = e.shape[0]
+
+        if m == 0:
+            b += 1
+            start_pos = 0
+            continue
+
+        i = start_pos if not found_any else 0
+        if i >= m or e[i, 0] != target_u:
+            if not found_any:
+                break
+            else:
+                break
+
+        found_any = 1
+
+        while i < m and e[i, 0] == target_u:
+            lv = lab[e[i, 1]]
+            counts[lv] = counts.get(lv, 0) + 1
+            i += 1
+
+        if i < m:
+            break
+
+        b += 1
+        start_pos = 0
+
+    if not found_any or not counts:
+        return -1
+
+    max_cnt = max(counts.values())
+
+    if tie_break == 1:
+        new_lab = min(lab_ for lab_, c in counts.items() if c == max_cnt)
+    elif tie_break == 2:
+        new_lab = max(lab_ for lab_, c in counts.items() if c == max_cnt)
+    else:
+        rng = Random(sweep_seed + target_u)
+        cands = [lab_ for lab_, c in counts.items() if c == max_cnt]
+        new_lab = rng.choice(cands)
+
+    old_lab = lab[target_u]
+    if new_lab != old_lab:
+        return int(new_lab)
+
+    return -1
+
